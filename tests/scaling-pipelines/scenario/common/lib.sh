@@ -84,8 +84,32 @@ function chains_setup_tekton_tekton_() {
 
 function chains_start() {
     info "Enabling Chains"
-    cosign_generate_key_pair_secret   # it was removed when we disabled Chains
+    # Enable first, then (re)create signing-secrets. Disabling Chains often deletes the
+    # secret; with Chains HA the operator also rolls pods, so creating the secret before
+    # enable races and leaves Chains without keys (signed=unknown for the whole run).
     kubectl patch TektonConfig/config --type='merge' -p='{"spec":{"chain":{"disabled": false}}}'
+    wait_for_entity_by_selector 300 openshift-pipelines deployment app.kubernetes.io/name=controller,app.kubernetes.io/part-of=tekton-chains
+    wait_for_entity_by_selector 300 openshift-pipelines pod app.kubernetes.io/part-of=tekton-chains
+    oc -n openshift-pipelines wait --for=condition=ready --timeout=300s pod -l app.kubernetes.io/part-of=tekton-chains
+
+    cosign_generate_key_pair_secret
+
+    # Confirm the secret sticks (HA reconcile must not delete it) and bounce Chains so
+    # every replica reloads signing-secrets.
+    before=$( date +%s )
+    while ! kubectl -n openshift-pipelines get secret/signing-secrets >/dev/null 2>&1; do
+        now=$( date +%s )
+        [ $(( $now - $before )) -gt 120 ] && fatal "signing-secrets missing after Chains enable"
+        debug "Waiting for signing-secrets to appear after Chains enable"
+        sleep 5
+        cosign_generate_key_pair_secret
+    done
+    kubectl -n openshift-pipelines rollout restart deployment -l app.kubernetes.io/part-of=tekton-chains || \
+        kubectl -n openshift-pipelines delete pod -l app.kubernetes.io/part-of=tekton-chains --wait=false || true
+    oc -n openshift-pipelines wait --for=condition=ready --timeout=300s pod -l app.kubernetes.io/part-of=tekton-chains
+    kubectl -n openshift-pipelines get secret/signing-secrets >/dev/null \
+        || fatal "signing-secrets disappeared after Chains restart"
+    info "Chains enabled with signing-secrets present"
 }
 
 function chains_stop() {
