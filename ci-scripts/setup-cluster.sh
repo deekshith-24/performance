@@ -108,9 +108,10 @@ case "$DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE" in
     *) fatal "DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE must be deployments or statefulSets (got: $DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE)" ;;
 esac
 
-# Empty means the Results API keeps its product default (QPS 5, burst 10).
+# Empty means the Results API keeps its product default (QPS 5, burst 10, replicas 1).
 results_api_kube_api_qps="${DEPLOYMENT_RESULTS_API_KUBE_API_QPS:-}"
 results_api_kube_api_burst="${DEPLOYMENT_RESULTS_API_KUBE_API_BURST:-}"
+results_api_ha_replicas="${DEPLOYMENT_RESULTS_API_HA_REPLICAS:-}"
 if [ "$INSTALL_RESULTS" == "true" ] && [ -n "${DEPLOYMENT_RESULTS_API_DISABLE_STORING_INCOMPLETE_RUNS:-}" ]; then
     fatal "DEPLOYMENT_RESULTS_API_DISABLE_STORING_INCOMPLETE_RUNS is a watcher setting; use DEPLOYMENT_RESULTS_WATCHER_DISABLE_STORING_INCOMPLETE_RUNS"
 fi
@@ -119,6 +120,9 @@ if [ -n "$results_api_kube_api_qps" ] && ! [[ "$results_api_kube_api_qps" =~ ^[1
 fi
 if [ -n "$results_api_kube_api_burst" ] && ! [[ "$results_api_kube_api_burst" =~ ^[1-9][0-9]*$ ]]; then
     fatal "DEPLOYMENT_RESULTS_API_KUBE_API_BURST must be a positive integer (got: $results_api_kube_api_burst)"
+fi
+if [ -n "$results_api_ha_replicas" ] && ! [[ "$results_api_ha_replicas" =~ ^[1-9][0-9]*$ ]]; then
+    fatal "DEPLOYMENT_RESULTS_API_HA_REPLICAS must be a positive integer (got: $results_api_ha_replicas)"
 fi
 
 OCP_VERSION="${OCP_VERSION:-$(oc get clusterversion version -o jsonpath='{.status.desired.version}'|cut -d. -f1,2)}"
@@ -1080,43 +1084,55 @@ EOF
     fi
 
     # A fresh baseline keeps the Results API defaults. Tune only when requested.
-    if [ -n "$results_api_kube_api_qps" ] || [ -n "$results_api_kube_api_burst" ]; then
+    if [ -n "$results_api_kube_api_qps" ] || [ -n "$results_api_kube_api_burst" ] || [ -n "$results_api_ha_replicas" ]; then
+        info "Configure Results API: replicas=${results_api_ha_replicas:-default}, QPS=${results_api_kube_api_qps:-default}, burst=${results_api_kube_api_burst:-default}"
         if [ "$DEPLOYMENT_TYPE_RESULTS" == "downstream" ]; then
             if [ "$DEPLOYMENT_VERSION" == "1.15" ] || { [ "$DEPLOYMENT_VERSION" != "nightly" ] && [ "$DEPLOYMENT_VERSION" != "custom" ] && ! version_gte "$DEPLOYMENT_VERSION" "1.18"; }; then
                 results_api_resource="TektonResult/result"
-                results_api_path='["spec","options","deployments","tekton-results-api","spec","template","spec","containers"]'
+                results_api_deploy_path='["spec","options","deployments","tekton-results-api","spec"]'
             else
                 results_api_resource="TektonConfig/config"
-                results_api_path='["spec","result","options","deployments","tekton-results-api","spec","template","spec","containers"]'
+                results_api_deploy_path='["spec","result","options","deployments","tekton-results-api","spec"]'
             fi
-            results_api_patch=$(jq -cn --argjson path "$results_api_path" \
-                --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" '
-                [if $qps != "" then {name:"K8S_QPS",value:$qps} else empty end,
-                 if $burst != "" then {name:"K8S_BURST",value:$burst} else empty end] as $env
-                | setpath($path; [{name:"api",env:$env}])')
+            results_api_patch=$(jq -cn --argjson path "$results_api_deploy_path" \
+                --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" \
+                --arg replicas "$results_api_ha_replicas" '
+                (if $replicas != "" then {replicas: ($replicas | tonumber)} else {} end) as $base
+                | [if $qps != "" then {name:"K8S_QPS",value:$qps} else empty end,
+                   if $burst != "" then {name:"K8S_BURST",value:$burst} else empty end] as $env
+                | (if ($env | length) > 0 then $base + {template:{spec:{containers:[{name:"api",env:$env}]}}} else $base end) as $spec
+                | setpath($path; $spec)')
             kubectl patch "$results_api_resource" -n "$TEKTON_RESULTS_NS" --type merge --patch "$results_api_patch"
         else
             # The upstream release manifest has no operator CR.
-            results_api_env_args=()
-            [ -z "$results_api_kube_api_qps" ] || results_api_env_args+=("K8S_QPS=$results_api_kube_api_qps")
-            [ -z "$results_api_kube_api_burst" ] || results_api_env_args+=("K8S_BURST=$results_api_kube_api_burst")
-            kubectl set env deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --containers=api "${results_api_env_args[@]}"
+            if [ -n "$results_api_ha_replicas" ]; then
+                kubectl scale deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --replicas="$results_api_ha_replicas"
+            fi
+            if [ -n "$results_api_kube_api_qps" ] || [ -n "$results_api_kube_api_burst" ]; then
+                results_api_env_args=()
+                [ -z "$results_api_kube_api_qps" ] || results_api_env_args+=("K8S_QPS=$results_api_kube_api_qps")
+                [ -z "$results_api_kube_api_burst" ] || results_api_env_args+=("K8S_BURST=$results_api_kube_api_burst")
+                kubectl set env deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --containers=api "${results_api_env_args[@]}"
+            fi
         fi
 
-        # Wait for the Deployment template to contain the requested values.
-        results_api_env_applied=false
+        # Wait for the Deployment to reflect the requested replicas / env.
+        results_api_applied=false
         for i in {1..60}; do
             if kubectl get deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" -o json | \
-                jq -e --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" '
-                    [.spec.template.spec.containers[] | select(.name == "api") | .env[]?] as $env
-                    | ($qps == "" or any($env[]; .name == "K8S_QPS" and .value == $qps))
+                jq -e --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" \
+                    --arg replicas "$results_api_ha_replicas" '
+                    (.spec.replicas | tostring) as $have_replicas
+                    | [.spec.template.spec.containers[] | select(.name == "api") | .env[]?] as $env
+                    | ($replicas == "" or $have_replicas == $replicas)
+                    and ($qps == "" or any($env[]; .name == "K8S_QPS" and .value == $qps))
                     and ($burst == "" or any($env[]; .name == "K8S_BURST" and .value == $burst))' >/dev/null 2>&1; then
-                results_api_env_applied=true
+                results_api_applied=true
                 break
             fi
             sleep 2
         done
-        [ "$results_api_env_applied" == "true" ] || fatal "Results API Deployment did not receive the requested K8S_QPS/K8S_BURST settings"
+        [ "$results_api_applied" == "true" ] || fatal "Results API Deployment did not receive the requested replicas/QPS/burst settings"
         kubectl rollout status deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --timeout=300s
     fi
 

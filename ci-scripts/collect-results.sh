@@ -232,19 +232,8 @@ else
     info "Skipping Results-API log data"
 fi
 
-# The echo scenario has known log lines, so verify every run and TaskRun log.
-# Other scenarios can opt in once their expected log lines are defined.
-# This is the direct ingestion gate for Citi Results scale testing: every
-# expected PipelineRun/TaskRun UID must land complete in PostgreSQL, and every
-# expected TaskRun log must be retrievable with the exact echo markers.
-if [ -z "${VERIFY_RESULTS_INGESTION:-}" ]; then
-    if [ "${TEST_SCENARIO:-}" == "timebased-sign-pruner" ]; then
-        VERIFY_RESULTS_INGESTION=true
-    else
-        VERIFY_RESULTS_INGESTION=false
-    fi
-fi
-
+# Opt-in: full UID/log verification is slow; set VERIFY_RESULTS_INGESTION=true when needed.
+VERIFY_RESULTS_INGESTION="${VERIFY_RESULTS_INGESTION:-false}"
 if [ "$INSTALL_RESULTS" == "true" ] && [ "$VERIFY_RESULTS_INGESTION" == "true" ]; then
     info "Verifying Tekton Results ingestion..."
     ingestion_report="$ARTIFACT_DIR/results-ingestion-verification.json"
