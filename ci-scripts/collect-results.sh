@@ -173,15 +173,18 @@ if [ "$INSTALL_RESULTS" == "true" ]; then
     # JSON fields from log lines
     JQ_FIELDS_TO_EXTRACT='{timestamp: .ts, "grpc.start_time": .["grpc.start_time"], "grpc.request.deadline": .["grpc.request.deadline"], "grpc.method": .["grpc.method"], "grpc.code": .["grpc.code"], "grpc.time_duration_in_ms": .["grpc.time_duration_in_ms"]}'
 
-    # Fetch logs from results-api pods
-    oc -n openshift-pipelines logs --tail=-1 -l app.kubernetes.io/name=tekton-results-api >> "$results_api_logs"
-    oc -n tekton-pipelines logs --tail=-1 -l app.kubernetes.io/name=tekton-results-api >> "$results_api_logs"
+    # Fetch logs from results-api pods (downstream: openshift-pipelines; upstream: tekton-pipelines).
+    # Missing namespace/pods and HA multi-stream log fetch must not fail the job (set -e / pipefail).
+    oc -n openshift-pipelines logs --tail=-1 --max-log-requests=20 -l app.kubernetes.io/name=tekton-results-api >>"$results_api_logs" 2>/dev/null || true
+    oc -n tekton-pipelines logs --tail=-1 --max-log-requests=20 -l app.kubernetes.io/name=tekton-results-api >>"$results_api_logs" 2>/dev/null || true
 
-    # Parse and store JSON log lines 
+    # Parse and store JSON log lines. HA API logs are noisy; keep parse errors as artifacts only.
     echo "[" > "$results_api_json"
-    grep -oE '\{[^}]+\}' "$results_api_logs" \
-        | jq -e -c "$JQ_FIELDS_TO_EXTRACT" 2>"$results_api_error_logs" \
-        | sed '$!s/$/,/' >> "$results_api_json"
+    if [ -s "$results_api_logs" ]; then
+        grep -oE '\{[^}]+\}' "$results_api_logs" \
+            | jq -c "$JQ_FIELDS_TO_EXTRACT" 2>"$results_api_error_logs" \
+            | sed '$!s/$/,/' >>"$results_api_json" || true
+    fi
     echo "]" >> "$results_api_json"
 
     info "Parsing Locust summary stats"

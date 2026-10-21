@@ -87,10 +87,15 @@ function chains_start() {
     # Enable first, then (re)create signing-secrets. Disabling Chains often deletes the
     # secret; with Chains HA the operator also rolls pods, so creating the secret before
     # enable races and leaves Chains without keys (signed=unknown for the whole run).
+    # HA=10 rolls routinely exceed 300s; prefer rollout status and keep going once the
+    # secret is present (timebased-sign-pruner runs this in a background subshell).
+    local chains_ready_timeout="${CHAINS_READY_TIMEOUT:-600s}"
     kubectl patch TektonConfig/config --type='merge' -p='{"spec":{"chain":{"disabled": false}}}'
     wait_for_entity_by_selector 300 openshift-pipelines deployment app.kubernetes.io/name=controller,app.kubernetes.io/part-of=tekton-chains
     wait_for_entity_by_selector 300 openshift-pipelines pod app.kubernetes.io/part-of=tekton-chains
-    oc -n openshift-pipelines wait --for=condition=ready --timeout=300s pod -l app.kubernetes.io/part-of=tekton-chains
+    kubectl -n openshift-pipelines rollout status deployment -l app.kubernetes.io/part-of=tekton-chains --timeout="$chains_ready_timeout" \
+        || oc -n openshift-pipelines wait --for=condition=ready --timeout="$chains_ready_timeout" pod -l app.kubernetes.io/part-of=tekton-chains \
+        || warning "Chains pods not fully ready after enable; continuing to create signing-secrets"
 
     cosign_generate_key_pair_secret
 
@@ -106,7 +111,9 @@ function chains_start() {
     done
     kubectl -n openshift-pipelines rollout restart deployment -l app.kubernetes.io/part-of=tekton-chains || \
         kubectl -n openshift-pipelines delete pod -l app.kubernetes.io/part-of=tekton-chains --wait=false || true
-    oc -n openshift-pipelines wait --for=condition=ready --timeout=300s pod -l app.kubernetes.io/part-of=tekton-chains
+    kubectl -n openshift-pipelines rollout status deployment -l app.kubernetes.io/part-of=tekton-chains --timeout="$chains_ready_timeout" \
+        || oc -n openshift-pipelines wait --for=condition=ready --timeout="$chains_ready_timeout" pod -l app.kubernetes.io/part-of=tekton-chains \
+        || warning "Chains pods not fully ready after signing-secrets restart; secret is present, continuing"
     kubectl -n openshift-pipelines get secret/signing-secrets >/dev/null \
         || fatal "signing-secrets disappeared after Chains restart"
     info "Chains enabled with signing-secrets present"
