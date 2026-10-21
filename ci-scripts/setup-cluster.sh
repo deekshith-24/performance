@@ -890,6 +890,20 @@ EOF
           info "Enabling Tekton-Result in Tekton Operator"
           kubectl patch TektonConfig/config --type merge --patch '{"spec":{"result":{"disabled":false,"auth_disable":true,"loki_stack_name":"logging-loki","loki_stack_namespace":"openshift-logging"}}}'
 
+          # Wait for the default Results install to finish before Watcher HA / statefulSets
+          # patches. Applying those while InstallerSets are still converging races the
+          # operator (SAs missing → FailedCreate, Deployments torn down, API never Ready).
+          info "Waiting for baseline Tekton Results before Watcher HA/STS configuration"
+          wait_for_entity_by_selector 300 "$TEKTON_RESULTS_NS" pod app.kubernetes.io/name=tekton-results-api
+          wait_for_entity_by_selector 300 "$TEKTON_RESULTS_NS" pod app.kubernetes.io/name=tekton-results-watcher
+          wait_for_ready_pods 300 "$TEKTON_RESULTS_NS" app.kubernetes.io/name=tekton-results-api 1
+          wait_for_ready_pods 300 "$TEKTON_RESULTS_NS" app.kubernetes.io/name=tekton-results-watcher 1
+          for sa in tekton-results-api tekton-results-watcher; do
+              if ! kubectl -n "$TEKTON_RESULTS_NS" get "sa/$sa" >/dev/null 2>&1; then
+                  fatal "Baseline Results install missing ServiceAccount $sa"
+              fi
+          done
+
           info "Configure Results Watcher performance: ${DEPLOYMENT_RESULTS_WATCHER_HA_REPLICAS:-no HA}, type=$DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE"
           results_watcher_performance_options=""
           # These fields are not translated to valid flags by the OSP 1.23
@@ -1029,9 +1043,12 @@ EOF
 
         fi
 
-        # Wait for tekton-results resources to start
+        # Wait for tekton-results resources after enable + any Watcher HA/STS patches
+        results_watcher_expected_replicas="${DEPLOYMENT_RESULTS_WATCHER_HA_REPLICAS:-1}"
         wait_for_entity_by_selector 300 $TEKTON_RESULTS_NS pod app.kubernetes.io/name=tekton-results-api
-        wait_for_entity_by_selector 300 $TEKTON_RESULTS_NS pod app.kubernetes.io/name=tekton-results-watcher
+        wait_for_entity_by_selector 300 $TEKTON_RESULTS_NS pod app.kubernetes.io/name=tekton-results-watcher "$results_watcher_expected_replicas"
+        wait_for_ready_pods 300 $TEKTON_RESULTS_NS app.kubernetes.io/name=tekton-results-api 1
+        wait_for_ready_pods 300 $TEKTON_RESULTS_NS app.kubernetes.io/name=tekton-results-watcher "$results_watcher_expected_replicas"
 
         # Setup route to access Results-API endpoint
         # TODO: Should test this with CI setup and also should evaluate how encryption works
