@@ -867,7 +867,7 @@ spec:
           labelKeys:
           - log_type
           - kubernetes.namespace_name
-          - openshift_cluster_id
+          - openshift.cluster_id
       authentication:
         token:
           from: serviceAccount
@@ -1106,8 +1106,17 @@ EOF
         fatal "Unknown deployment type '$DEPLOYMENT_TYPE_RESULTS'"
     fi
 
-    # A fresh baseline keeps the Results API defaults. Tune only when requested.
-    if [ -n "$results_api_kube_api_qps" ] || [ -n "$results_api_kube_api_burst" ] || [ -n "$results_api_ha_replicas" ] || [ -n "$results_api_auth_disable" ]; then
+    # Scope Loki queries to this cluster when independent stacks share a bucket.
+    # The collector exports openshift.cluster_id as the openshift_cluster_id stream label.
+    results_api_loki_labels=""
+    if [ "$DEPLOYMENT_TYPE_RESULTS" == "downstream" ] && [ "$DEPLOYMENT_VERSION" != "1.15" ]; then
+        results_loki_cluster_id=$(kubectl get clusterversion version -o jsonpath='{.spec.clusterID}')
+        [ -n "$results_loki_cluster_id" ] || fatal "Cannot scope Results log queries: cluster ID is empty"
+        results_api_loki_labels="log_type=application,openshift_cluster_id=$results_loki_cluster_id"
+    fi
+
+    # A fresh baseline keeps the Results API performance defaults unless requested.
+    if [ -n "$results_api_kube_api_qps" ] || [ -n "$results_api_kube_api_burst" ] || [ -n "$results_api_ha_replicas" ] || [ -n "$results_api_auth_disable" ] || [ -n "$results_api_loki_labels" ]; then
         info "Configure Results API: replicas=${results_api_ha_replicas:-default}, QPS=${results_api_kube_api_qps:-default}, burst=${results_api_kube_api_burst:-default}, AUTH_DISABLE=${results_api_auth_disable:-unchanged}"
         if [ "$DEPLOYMENT_TYPE_RESULTS" == "downstream" ]; then
             if [ "$DEPLOYMENT_VERSION" == "1.15" ] || { [ "$DEPLOYMENT_VERSION" != "nightly" ] && [ "$DEPLOYMENT_VERSION" != "custom" ] && ! version_gte "$DEPLOYMENT_VERSION" "1.18"; }; then
@@ -1117,15 +1126,20 @@ EOF
                 results_api_resource="TektonConfig/config"
                 results_api_deploy_path='["spec","result","options","deployments","tekton-results-api","spec"]'
             fi
-            results_api_patch=$(jq -cn --argjson path "$results_api_deploy_path" \
+            results_api_patch=$(kubectl get "$results_api_resource" -n "$TEKTON_RESULTS_NS" -o json | jq -c --argjson path "$results_api_deploy_path" \
                 --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" \
-                --arg replicas "$results_api_ha_replicas" --arg auth_disable "$results_api_auth_disable" '
-                (if $replicas != "" then {replicas: ($replicas | tonumber)} else {} end) as $base
+                --arg replicas "$results_api_ha_replicas" --arg auth_disable "$results_api_auth_disable" \
+                --arg loki_labels "$results_api_loki_labels" '
+                (getpath($path).template.spec.containers // []) as $containers
+                | (if $replicas != "" then {replicas: ($replicas | tonumber)} else {} end) as $base
                 | [if $qps != "" then {name:"K8S_QPS",value:$qps} else empty end,
                    if $burst != "" then {name:"K8S_BURST",value:$burst} else empty end,
-                   if $auth_disable != "" then {name:"AUTH_DISABLE",value:$auth_disable} else empty end] as $env
-                | (if ($env | length) > 0 then $base + {template:{spec:{containers:[{name:"api",env:$env}]}}} else $base end) as $spec
-                | setpath($path; $spec)')
+                   if $auth_disable != "" then {name:"AUTH_DISABLE",value:$auth_disable} else empty end,
+                   if $loki_labels != "" then {name:"LOGGING_PLUGIN_STATIC_LABELS",value:$loki_labels} else empty end] as $env
+                | ([$containers[] | select(.name == "api")][0] // {name:"api"}) as $api
+                | ($api + {env: ([$api.env[]? | select(.name as $name | all($env[]; .name != $name))] + $env)}) as $api
+                | (if ($env | length) > 0 then $base + {template:{spec:{containers:([$containers[] | select(.name != "api")] + [$api])}}} else $base end) as $spec
+                | {} | setpath($path; $spec)')
             kubectl patch "$results_api_resource" -n "$TEKTON_RESULTS_NS" --type merge --patch "$results_api_patch"
         else
             # The upstream release manifest has no operator CR.
@@ -1146,19 +1160,21 @@ EOF
         for i in {1..60}; do
             if kubectl get deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" -o json | \
                 jq -e --arg qps "$results_api_kube_api_qps" --arg burst "$results_api_kube_api_burst" \
-                    --arg replicas "$results_api_ha_replicas" --arg auth_disable "$results_api_auth_disable" '
+                    --arg replicas "$results_api_ha_replicas" --arg auth_disable "$results_api_auth_disable" \
+                    --arg loki_labels "$results_api_loki_labels" '
                     (.spec.replicas | tostring) as $have_replicas
                     | [.spec.template.spec.containers[] | select(.name == "api") | .env[]?] as $env
                     | ($replicas == "" or $have_replicas == $replicas)
                     and ($qps == "" or any($env[]; .name == "K8S_QPS" and .value == $qps))
                     and ($burst == "" or any($env[]; .name == "K8S_BURST" and .value == $burst))
-                    and ($auth_disable == "" or any($env[]; .name == "AUTH_DISABLE" and .value == $auth_disable))' >/dev/null 2>&1; then
+                    and ($auth_disable == "" or any($env[]; .name == "AUTH_DISABLE" and .value == $auth_disable))
+                    and ($loki_labels == "" or any($env[]; .name == "LOGGING_PLUGIN_STATIC_LABELS" and .value == $loki_labels))' >/dev/null 2>&1; then
                 results_api_applied=true
                 break
             fi
             sleep 2
         done
-        [ "$results_api_applied" == "true" ] || fatal "Results API Deployment did not receive the requested replicas/QPS/burst/authentication settings"
+        [ "$results_api_applied" == "true" ] || fatal "Results API Deployment did not receive the requested replicas/QPS/burst/authentication/log query settings"
         kubectl rollout status deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --timeout=300s
     fi
 
