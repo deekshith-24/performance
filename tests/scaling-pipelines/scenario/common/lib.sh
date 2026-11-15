@@ -84,31 +84,12 @@ function chains_setup_tekton_tekton_() {
 
 function chains_start() {
     info "Enabling Chains"
-    # Enable first, then (re)create signing-secrets. Disabling Chains often deletes the
-    # secret; with Chains HA the operator also rolls pods, so creating the secret before
-    # enable races and leaves Chains without keys (signed=unknown for the whole run).
-    # HA=10 rolls routinely exceed 300s; prefer rollout status and keep going once the
-    # secret is present (timebased-sign-pruner runs this in a background subshell).
+    # Disabling Chains can remove signing-secrets. Recreate keys after enable,
+    # before waiting for pod readiness, then restart so every replica reloads them.
     local chains_ready_timeout="${CHAINS_READY_TIMEOUT:-600s}"
     kubectl patch TektonConfig/config --type='merge' -p='{"spec":{"chain":{"disabled": false}}}'
     wait_for_entity_by_selector 300 openshift-pipelines deployment app.kubernetes.io/name=controller,app.kubernetes.io/part-of=tekton-chains
-    wait_for_entity_by_selector 300 openshift-pipelines pod app.kubernetes.io/part-of=tekton-chains
-    kubectl -n openshift-pipelines rollout status deployment -l app.kubernetes.io/part-of=tekton-chains --timeout="$chains_ready_timeout" \
-        || oc -n openshift-pipelines wait --for=condition=ready --timeout="$chains_ready_timeout" pod -l app.kubernetes.io/part-of=tekton-chains \
-        || warning "Chains pods not fully ready after enable; continuing to create signing-secrets"
-
     cosign_generate_key_pair_secret
-
-    # Confirm the secret sticks (HA reconcile must not delete it) and bounce Chains so
-    # every replica reloads signing-secrets.
-    before=$( date +%s )
-    while ! kubectl -n openshift-pipelines get secret/signing-secrets >/dev/null 2>&1; do
-        now=$( date +%s )
-        [ $(( $now - $before )) -gt 120 ] && fatal "signing-secrets missing after Chains enable"
-        debug "Waiting for signing-secrets to appear after Chains enable"
-        sleep 5
-        cosign_generate_key_pair_secret
-    done
     kubectl -n openshift-pipelines rollout restart deployment -l app.kubernetes.io/part-of=tekton-chains || \
         kubectl -n openshift-pipelines delete pod -l app.kubernetes.io/part-of=tekton-chains --wait=false || true
     kubectl -n openshift-pipelines rollout status deployment -l app.kubernetes.io/part-of=tekton-chains --timeout="$chains_ready_timeout" \
@@ -349,8 +330,6 @@ function run_locust() {
 
         # Locust test
         local LOCUST_NAMESPACE=locust-operator
-        local LOCUST_OPERATOR_REPO=locust-k8s-operator
-        local LOCUST_OPERATOR=locust-operator
         local LOCUST_TEMPLATE="scenario/common/locust-test-template.yaml"
         local LOCUST_LOG="${LOCUST_LOG:-locust-test.log}"
 
@@ -417,16 +396,6 @@ function run_locust() {
                 sleep 2
             fi
         done
-
-        if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$SCENARIO" == "fetch-log" ] && [ "$LOCUST_RUN_PHASE" == "concurrent" ]; then
-            # Worker samples are relayed live into the master log. The operator
-            # can remove workers before this post-window API/Loki snapshot runs.
-            python3 ../../tools/results_log_diagnostics.py \
-                --output "${LOCUST_LOG%.log}-diagnostics" \
-                --since-time "$(cat "${TMP_DIR}/benchmark-before")" \
-                --budget 60 \
-                || warning "Some Results/Loki diagnostics are unavailable; inspect results-log-diagnostics.json"
-        fi
 
         # Cleanup locust job after test end
         cleanup_locust "$SCENARIO"

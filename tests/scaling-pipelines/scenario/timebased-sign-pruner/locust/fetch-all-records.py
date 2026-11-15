@@ -6,17 +6,15 @@ import urllib3
 urllib3.disable_warnings(InsecureRequestWarning)
 
 
-class FetchAllRecordsTest(HttpUser):
-    '''
-    User scenario to fetch all records
-    '''
+class ListRecordsTest(HttpUser):
+    """Read the default first page of Results records."""
     def on_start(self):
         self.client.verify = False
         configure_results_auth(self.client)
 
     @task
     def get_records(self) -> None:
-        """Get all records"""
+        """List records using the API's default pagination."""
         self.client.get(
             "/apis/results.tekton.dev/v1alpha2/parents/-/results/-/records",
             name='/records',

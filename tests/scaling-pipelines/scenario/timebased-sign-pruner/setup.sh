@@ -14,6 +14,11 @@ esac
 TEST_BIGBANG_MULTI_STEP__TASK_COUNT="${TEST_BIGBANG_MULTI_STEP__TASK_COUNT:-5}"
 TEST_BIGBANG_MULTI_STEP__STEP_COUNT="${TEST_BIGBANG_MULTI_STEP__STEP_COUNT:-10}"
 TEST_BIGBANG_MULTI_STEP__LINE_COUNT="${TEST_BIGBANG_MULTI_STEP__LINE_COUNT:-15}"
+TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP="${TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP:-0}"
+if ! [[ "$TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fatal "TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP must be a non-negative integer"
+fi
+info "Workload: tasks=${TEST_BIGBANG_MULTI_STEP__TASK_COUNT}, steps_per_task=${TEST_BIGBANG_MULTI_STEP__STEP_COUNT}, lines_per_step=${TEST_BIGBANG_MULTI_STEP__LINE_COUNT}, log_bytes_per_step=${TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP} (0 uses line count)"
 
 # Execution mode: either TEST_TOTAL (count-based) or TOTAL_TIMEOUT (time-based)
 # TOTAL_TIMEOUT takes precedence if both are set (handles load-test.sh's TEST_TOTAL=100 default)
@@ -65,7 +70,7 @@ else
     export TEST_PARAMS=""
 fi
 
-create_pipeline_from_j2_template pipeline.yaml.j2 "task_count=${TEST_BIGBANG_MULTI_STEP__TASK_COUNT}, step_count=${TEST_BIGBANG_MULTI_STEP__STEP_COUNT}, line_count=${TEST_BIGBANG_MULTI_STEP__LINE_COUNT}"
+create_pipeline_from_j2_template pipeline.yaml.j2 "task_count=${TEST_BIGBANG_MULTI_STEP__TASK_COUNT}, step_count=${TEST_BIGBANG_MULTI_STEP__STEP_COUNT}, line_count=${TEST_BIGBANG_MULTI_STEP__LINE_COUNT}, log_bytes_per_step=${TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP}"
 
 if [ "$LOCUST_RUN_PHASE" == concurrent ]; then
     # Finish background cleanup before the outer CI trap collects artifacts.

@@ -182,6 +182,12 @@ if [ "$INSTALL_RESULTS" == "true" ]; then
 
     capture_results_db_query "$pg_user" "$pg_pwd" "tekton-results" "select parent, type, count(*) from records group by parent, type order by parent" "$monitoring_collection_data"
 
+    # Physical sizes include PostgreSQL overhead; these are final snapshots,
+    # not serialized PLR/TR payload sizes or database growth rates.
+    info "Collecting Results-API DB Storage Sizes"
+    capture_results_db_query "$pg_user" "$pg_pwd" "tekton-results" "select current_database() as database_name, pg_database_size(current_database()) as database_size_bytes" "$monitoring_collection_data"
+    capture_results_db_query "$pg_user" "$pg_pwd" "tekton-results" "select relname as table_name, pg_table_size(relid) as table_size_bytes, pg_indexes_size(relid) as indexes_size_bytes, pg_total_relation_size(relid) as total_size_bytes from pg_stat_user_tables where schemaname = 'public' and relname in ('results', 'records') order by relname" "$monitoring_collection_data"
+
 
     info "Parsing Locust summary stats"
     locust_log="$ARTIFACT_DIR/locust-test.log"

@@ -61,7 +61,7 @@ def api_records(text, namespace, pod, container):
     return records, malformed
 
 
-def collect(output, since_time=None, budget=60, include_locust=False):
+def collect(output, since_time=None, budget=60):
     output = Path(output)
     logs_dir = output / 'results-loki-pod-logs'
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -88,16 +88,12 @@ def collect(output, since_time=None, budget=60, include_locust=False):
 
     targets = [('openshift-pipelines', 'api'), ('tekton-pipelines', 'api'),
                ('openshift-logging', 'loki')]
-    if include_locust:
-        targets.insert(0, ('locust-operator', 'locust'))
     # Preserve the historical combined API log and summary paths for consumers.
     with (output / 'results-api-logs.txt').open('w') as combined:
         for namespace, kind in targets:
             args = ['get', 'pods', '-o', 'json']
             if kind == 'api':
                 args += ['-l', 'app.kubernetes.io/name=tekton-results-api']
-            elif kind == 'locust':
-                args += ['-l', 'locust.io/test-run=fetch-log-test']
             try:
                 pods = json.loads(call(namespace, args)).get('items', [])
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -160,11 +156,10 @@ if __name__ == '__main__':
     parser.add_argument('--output', required=True)
     parser.add_argument('--since-time')
     parser.add_argument('--budget', type=int, default=60)
-    parser.add_argument('--include-locust', action='store_true')
     args = parser.parse_args()
     if args.budget <= 0:
         parser.error('--budget must be positive')
-    result = collect(args.output, args.since_time, args.budget, args.include_locust)
+    result = collect(args.output, args.since_time, args.budget)
     print('Captured {} log streams; {} diagnostic collection errors'.format(
         len(result['streams']), len(result['errors'])))
     raise SystemExit(int(bool(result['errors'])))
