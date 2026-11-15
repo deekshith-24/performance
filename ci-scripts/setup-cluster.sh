@@ -118,6 +118,10 @@ results_api_kube_api_burst="${DEPLOYMENT_RESULTS_API_KUBE_API_BURST:-}"
 results_api_ha_replicas="${DEPLOYMENT_RESULTS_API_HA_REPLICAS:-}"
 # Empty preserves the existing downstream auth-disabled setup and upstream defaults.
 results_api_auth_disable="${DEPLOYMENT_RESULTS_API_AUTH_DISABLE:-}"
+results_postgres_storage_size="${DEPLOYMENT_RESULTS_POSTGRES_STORAGE_SIZE:-}"
+if [ -n "$results_postgres_storage_size" ] && ! [[ "$results_postgres_storage_size" =~ ^[1-9][0-9]*Gi$ ]]; then
+    fatal "DEPLOYMENT_RESULTS_POSTGRES_STORAGE_SIZE must be a positive Gi quantity, for example 20Gi"
+fi
 case "$results_api_auth_disable" in
     ""|true|false) ;;
     *) fatal "DEPLOYMENT_RESULTS_API_AUTH_DISABLE must be true or false" ;;
@@ -1192,6 +1196,16 @@ EOF
         done
         [ "$results_api_applied" == "true" ] || fatal "Results API Deployment did not receive the requested replicas/QPS/burst/authentication/log query settings"
         kubectl rollout status deployment/tekton-results-api -n "$TEKTON_RESULTS_NS" --timeout=300s
+    fi
+
+    if [ -n "$results_postgres_storage_size" ]; then
+        # Expand the bundled database PVC without changing existing test defaults.
+        # The storage class must support expansion; never delete database storage.
+        info "Expanding Results PostgreSQL storage to $results_postgres_storage_size"
+        kubectl -n "$TEKTON_RESULTS_NS" patch pvc/postgredb-tekton-results-postgres-0 \
+            --type merge --patch "$(jq -cn --arg size "$results_postgres_storage_size" '{spec:{resources:{requests:{storage:$size}}}}')"
+        kubectl -n "$TEKTON_RESULTS_NS" wait pvc/postgredb-tekton-results-postgres-0 \
+            --for="jsonpath={.status.capacity.storage}=$results_postgres_storage_size" --timeout=300s
     fi
 
     info "Tekton-Results Deployment finished"
