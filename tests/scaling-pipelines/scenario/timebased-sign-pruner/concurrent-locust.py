@@ -154,7 +154,8 @@ def verify_overlap():
 def cleanup(child, scenario):
     deadline = time.monotonic() + CLEANUP_MARGIN
     errors = []
-    if child is not None:
+    recovered = []
+    if child is not None and child.poll() is None:
         try:
             os.killpg(child.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -170,34 +171,60 @@ def cleanup(child, scenario):
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 errors.append("process (did not exit after SIGKILL)")
-    for resource, name in (("locusttest", scenario + "-test"),
-                           ("configmap", "locust." + scenario)):
-        try:
-            subprocess.run(
-                ["kubectl", "delete", "-n", "locust-operator", resource, name,
-                 "--ignore-not-found=true", "--wait=false", "--request-timeout=5s"],
-                timeout=10, check=True,
-            )
-        except (OSError, subprocess.SubprocessError):
-            errors.append(resource)
-    try:
-        # An interrupted master must not leave worker pods reading during the next iteration.
-        # Use the remaining cleanup budget: ten seconds can be shorter than a
-        # worker's normal graceful termination period.
+    pending = {
+        "locusttest": ["locusttest", scenario + "-test"],
+        "configmap": ["configmap", "locust." + scenario],
+        "pods": ["pod", "-l", f"locust.io/test-run={scenario}-test"],
+    }
+    last_errors = {}
+    observed_errors = {}
+
+    def detail(exc):
+        message = getattr(exc, "stderr", None) or str(exc)
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", errors="replace")
+        return message[-400:]
+
+    def request(verb, target):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("Locust cleanup budget exhausted")
-        pod_wait_seconds = max(1, int(remaining - 1))
-        subprocess.run(
-            ["kubectl", "delete", "pod", "-n", "locust-operator", "-l",
-             f"locust.io/test-run={scenario}-test", "--ignore-not-found=true",
-             "--wait=true", f"--timeout={pod_wait_seconds}s", "--request-timeout=5s"],
-            timeout=remaining, check=True,
+            raise subprocess.TimeoutExpired("Locust cleanup budget", CLEANUP_MARGIN)
+        return subprocess.run(
+            ["kubectl", verb, "-n", "locust-operator"] + target
+            + ["--ignore-not-found=true", "--request-timeout=5s"]
+            + (["--wait=false"] if verb == "delete" else ["-o", "name"]),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            timeout=min(10, remaining), check=True,
         )
-    except (OSError, subprocess.SubprocessError):
-        errors.append("pods")
+
+    # A delete request can fail after the server has accepted it. Verify absence
+    # and retry within the original budget instead of treating that alone as a
+    # failed iteration. A failed GET never proves absence. Verify pods as well,
+    # so reads from one iteration cannot leak into the next.
+    while pending and time.monotonic() < deadline:
+        for resource, target in list(pending.items()):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                request("delete", target)
+            except (OSError, subprocess.SubprocessError) as exc:
+                last_errors[resource] = observed_errors[resource] = detail(exc)
+            try:
+                result = request("get", target)
+                if not result.stdout.strip():
+                    del pending[resource]
+                    if resource in observed_errors:
+                        recovered.append(resource + ": " + observed_errors.pop(resource))
+                else:
+                    last_errors[resource] = "resource still exists"
+            except (OSError, subprocess.SubprocessError) as exc:
+                last_errors[resource] = observed_errors[resource] = detail(exc)
+        if pending:
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+    errors.extend(resource + ": " + last_errors.get(resource, "deletion not verified") for resource in pending)
     if errors:
         raise RuntimeError("Locust cleanup failed for: " + ", ".join(errors))
+    return recovered
 
 
 def run_iteration(scenario, iteration, config, cutoff, check_parent):
@@ -246,7 +273,9 @@ def run_iteration(scenario, iteration, config, cutoff, check_parent):
         if iteration["status"] == "running":
             iteration.update(status="incomplete", error="Ingestion exited or coordinator was interrupted")
         try:
-            cleanup(child, scenario)
+            recovered = cleanup(child, scenario)
+            if recovered:
+                iteration["cleanup_recovered_errors"] = recovered
         except RuntimeError as exc:
             iteration.update(status="failed", cleanup_error=str(exc))
             raise

@@ -25,6 +25,10 @@ DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE="${DEPLOYMENT_RESULTS_WATCHER_CONTROL
 
 # Loki stack configuration: https://access.redhat.com/solutions/7006859
 LOKI_STACK_SIZE="1x.demo" # Other options: 1x.demo, 1x.small, 1x.extra-small
+LOKI_QUERIER_REPLICAS="${LOKI_QUERIER_REPLICAS:-1}"
+if ! [[ "$LOKI_QUERIER_REPLICAS" =~ ^[1-9][0-9]*$ ]]; then
+    fatal "LOKI_QUERIER_REPLICAS must be a positive integer (got: $LOKI_QUERIER_REPLICAS)"
+fi
 
 # Locust setup config - using official Locust operator
 RUN_LOCUST="${RUN_LOCUST:-false}"
@@ -824,6 +828,9 @@ spec:
   managementState: Managed
   replicationFactor: 1
   size: $LOKI_STACK_SIZE
+  template:
+    querier:
+      replicas: $LOKI_QUERIER_REPLICAS
   storage:
     schemas:
     - effectiveDate: "2023-10-15"
@@ -835,6 +842,15 @@ spec:
   tenants:
     mode: openshift-logging
 EOF
+
+        if [ "$LOKI_QUERIER_REPLICAS" != "1" ]; then
+            info "Waiting for $LOKI_QUERIER_REPLICAS Loki querier replicas"
+            wait_for_entity_by_selector 300 openshift-logging deployment app.kubernetes.io/component=querier 1
+            kubectl -n openshift-logging wait deployment/logging-loki-querier \
+                --for="jsonpath={.spec.replicas}=$LOKI_QUERIER_REPLICAS" --timeout=300s
+            kubectl -n openshift-logging rollout status deployment/logging-loki-querier --timeout=300s
+            wait_for_ready_pods 300 openshift-logging app.kubernetes.io/component=querier "$LOKI_QUERIER_REPLICAS"
+        fi
 
         # Installing OpenShift Logging
         # Create Service Account and give it permission required.

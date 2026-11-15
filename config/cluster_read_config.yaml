@@ -326,6 +326,23 @@
   monitoring_step: 15
 {% endfor %}
 
+# Frontend-managed queues are used when queriers connect directly to the frontend.
+# Collection requires one series per measurement. Sum queue depth and client
+# connections; retain the worst frontend's mean/p95 wait to expose uneven queues.
+# A tenant's queue-length series may disappear when it is inactive.
+- name: measurements.logs.loki.query_frontend_queue_length
+  monitoring_query: sum(loki_query_frontend_queue_length{namespace="openshift-logging"})
+  monitoring_step: 15
+- name: measurements.logs.loki.query_frontend_queue_p95_seconds
+  monitoring_query: max(histogram_quantile(0.95, sum by (pod, le) (rate(loki_query_frontend_queue_duration_seconds_bucket{namespace="openshift-logging"}[1m]))))
+  monitoring_step: 15
+- name: measurements.logs.loki.query_frontend_queue_mean_seconds
+  monitoring_query: max(sum by (pod) (rate(loki_query_frontend_queue_duration_seconds_sum{namespace="openshift-logging"}[1m])) / sum by (pod) (rate(loki_query_frontend_queue_duration_seconds_count{namespace="openshift-logging"}[1m])))
+  monitoring_step: 15
+- name: measurements.logs.loki.query_frontend_connected_clients
+  monitoring_query: sum(loki_query_frontend_connected_clients{namespace="openshift-logging"})
+  monitoring_step: 15
+
 # Depending on Loki's version/topology these may be absent. Do not manufacture
 # zeroes when the scheduler or its metrics are not deployed/scraped.
 - name: measurements.logs.loki.query_scheduler_queue_length
