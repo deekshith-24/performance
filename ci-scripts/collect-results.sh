@@ -203,8 +203,8 @@ import json, re, sys
 with open('$locust_log') as f:
     content = f.read()
 
-# Final summary is printed after 'Shutting down' for each scenario
-shutdown_blocks = content.split('Shutting down (exit code 0)')
+# Failed scenarios also print a final summary and must remain in the report.
+shutdown_blocks = re.split(r'Shutting down \(exit code \d+\)', content)
 
 results = {}
 for block in shutdown_blocks[1:]:

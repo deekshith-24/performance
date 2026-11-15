@@ -26,8 +26,15 @@ DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE="${DEPLOYMENT_RESULTS_WATCHER_CONTROL
 # Loki stack configuration: https://access.redhat.com/solutions/7006859
 LOKI_STACK_SIZE="1x.demo" # Other options: 1x.demo, 1x.small, 1x.extra-small
 LOKI_QUERIER_REPLICAS="${LOKI_QUERIER_REPLICAS:-1}"
+LOKI_INGESTION_RATE_MB="${LOKI_INGESTION_RATE_MB:-}"
+LOKI_INGESTION_BURST_MB="${LOKI_INGESTION_BURST_MB:-}"
 if ! [[ "$LOKI_QUERIER_REPLICAS" =~ ^[1-9][0-9]*$ ]]; then
     fatal "LOKI_QUERIER_REPLICAS must be a positive integer (got: $LOKI_QUERIER_REPLICAS)"
+fi
+if [ -n "$LOKI_INGESTION_RATE_MB$LOKI_INGESTION_BURST_MB" ]; then
+    if ! [[ "$LOKI_INGESTION_RATE_MB" =~ ^[1-9][0-9]*$ && "$LOKI_INGESTION_BURST_MB" =~ ^[1-9][0-9]*$ ]]; then
+        fatal "Set both LOKI_INGESTION_RATE_MB and LOKI_INGESTION_BURST_MB to positive integers"
+    fi
 fi
 
 # Locust setup config - using official Locust operator
@@ -818,6 +825,17 @@ EOF
         default_storage_class=$(kubectl get storageclass -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}')
 
         # Installing Loki
+        # Scope overrides to application logs; leave operator defaults intact otherwise.
+        loki_ingestion_limits=""
+        if [ -n "$LOKI_INGESTION_RATE_MB" ]; then
+            info "Loki application ingestion: ${LOKI_INGESTION_RATE_MB} MB/s, ${LOKI_INGESTION_BURST_MB} MB burst"
+            loki_ingestion_limits="  limits:
+    tenants:
+      application:
+        ingestion:
+          ingestionRate: $LOKI_INGESTION_RATE_MB
+          ingestionBurstSize: $LOKI_INGESTION_BURST_MB"
+        fi
         cat <<EOF | oc apply -f -
 apiVersion: loki.grafana.com/v1
 kind: LokiStack
@@ -828,6 +846,7 @@ spec:
   managementState: Managed
   replicationFactor: 1
   size: $LOKI_STACK_SIZE
+$loki_ingestion_limits
   template:
     querier:
       replicas: $LOKI_QUERIER_REPLICAS

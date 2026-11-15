@@ -333,12 +333,13 @@ function run_locust() {
         local LOCUST_TEMPLATE="scenario/common/locust-test-template.yaml"
         local LOCUST_LOG="${LOCUST_LOG:-locust-test.log}"
 
-        TMP_DIR=$(mktemp -d)
+        TMP_DIR=$(mktemp -d) || return $?
+        local locust_run_log="${TMP_DIR}/locust.log"
 
         info "Running Locust Scenario: ${SCENARIO}"
 
         # Cleanup locust jobs if it already exists
-        cleanup_locust "$SCENARIO"
+        cleanup_locust "$SCENARIO" || return $?
 
         # Create a ConfigMap from the scenario file FIRST (operator will check for it immediately)
         local locust_files=(--from-file="scenario/$TEST_SCENARIO/locust/${SCENARIO}.py")
@@ -351,10 +352,10 @@ function run_locust() {
         elif [ "$RESULTS_AUTH_ENABLED" == "true" ]; then
             fatal "Authenticated Results testing is unsupported by scenario $TEST_SCENARIO"
         fi
-        kubectl create --namespace "${LOCUST_NAMESPACE}" configmap locust."${SCENARIO}" "${locust_files[@]}" --dry-run=client -o yaml | kubectl apply --namespace "${LOCUST_NAMESPACE}" -f -
+        kubectl create --namespace "${LOCUST_NAMESPACE}" configmap locust."${SCENARIO}" "${locust_files[@]}" --dry-run=client -o yaml | kubectl apply --namespace "${LOCUST_NAMESPACE}" -f - || return $?
 
         # Apply locust test template with environment variable substitution
-        cat $LOCUST_TEMPLATE | envsubst | kubectl apply --namespace "${LOCUST_NAMESPACE}" -f -
+        cat $LOCUST_TEMPLATE | envsubst | kubectl apply --namespace "${LOCUST_NAMESPACE}" -f - || return $?
 
         # Record test start time
         date --utc -Ins > "${TMP_DIR}/benchmark-before"
@@ -372,7 +373,7 @@ function run_locust() {
         done
 
         # Wait for the Locust master pod to be ready
-        kubectl wait --namespace "${LOCUST_NAMESPACE}" --for=condition=Ready=true --timeout=5m $(kubectl get --namespace "${LOCUST_NAMESPACE}" pod -l "locust.io/test-run=${SCENARIO}-test,locust.io/component=master" -o name)
+        kubectl wait --namespace "${LOCUST_NAMESPACE}" --for=condition=Ready=true --timeout=5m $(kubectl get --namespace "${LOCUST_NAMESPACE}" pod -l "locust.io/test-run=${SCENARIO}-test,locust.io/component=master" -o name) || return $?
 
         # Get Locust master logs
         echo "Getting locust master log:"
@@ -385,7 +386,7 @@ function run_locust() {
         for ((locust_log_attempt=1; locust_log_attempt<=locust_log_attempts; locust_log_attempt++)); do
             # Reconnect to the same test, replaying retained logs. The coordinator
             # still requires a complete final summary; an interrupted stream is not a pass.
-            if kubectl logs --namespace "${LOCUST_NAMESPACE}" --tail=-1 -f -l "locust.io/test-run=${SCENARIO}-test,locust.io/component=master" 2>&1 | tee -a "$LOCUST_LOG"; then
+            if kubectl logs --namespace "${LOCUST_NAMESPACE}" --tail=-1 -f -l "locust.io/test-run=${SCENARIO}-test,locust.io/component=master" 2>&1 | tee -a "$LOCUST_LOG" "$locust_run_log"; then
                 locust_log_status=0
                 break
             else
@@ -397,8 +398,36 @@ function run_locust() {
             fi
         done
 
+        if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "after-load" ]; then
+            # A successful kubectl log stream does not imply a successful Locust test.
+            if ! python3 - "$locust_run_log" "$SCENARIO" "$LOCUST_DURATION" "$LOCUST_USERS" <<'PY'
+import importlib.util
+from pathlib import Path
+import re
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    "concurrent_locust", "scenario/timebased-sign-pruner/concurrent-locust.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    duration = re.fullmatch(r"([1-9][0-9]*)([hms]?)", sys.argv[3])
+    seconds = int(duration[1]) * {"h": 3600, "m": 60, "s": 1, "": 1}[duration[2]]
+    result = module.read_result(Path(sys.argv[1]).read_text(), sys.argv[2],
+                                {"duration_seconds": seconds, "users": int(sys.argv[4])})
+    if result["locust_exit_code"] or result["total_failed_requests"] or not result["user_count_verified"]:
+        raise ValueError(f"{result['total_failed_requests']} failed requests; "
+                         f"exit={result['locust_exit_code']}; users verified={result['user_count_verified']}")
+except (ValueError, TypeError) as exc:
+    sys.exit(f"Locust {sys.argv[2]} failed: {exc}")
+PY
+            then
+                locust_log_status=1
+            fi
+        fi
+
         # Cleanup locust job after test end
-        cleanup_locust "$SCENARIO"
+        cleanup_locust "$SCENARIO" || return $?
 
         # Record test end time
         date --utc -Ins > "${TMP_DIR}/benchmark-after"
@@ -413,6 +442,6 @@ function cleanup_locust(){
     export SCENARIO="$1"
     local LOCUST_NAMESPACE=locust-operator
     info "Cleaning LocustTest ${SCENARIO}-test"
-    kubectl delete --ignore-not-found=true --namespace "${LOCUST_NAMESPACE}" LocustTest "${SCENARIO}-test"
-    kubectl delete --ignore-not-found=true --namespace "${LOCUST_NAMESPACE}" configmap locust."${SCENARIO}"
+    kubectl delete --ignore-not-found=true --namespace "${LOCUST_NAMESPACE}" LocustTest "${SCENARIO}-test" || return $?
+    kubectl delete --ignore-not-found=true --namespace "${LOCUST_NAMESPACE}" configmap locust."${SCENARIO}" || return $?
 }
