@@ -1,0 +1,147 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: compile-go
+spec:
+  workspaces:
+    - name: source
+  params:
+    - name: builder-image
+      type: string
+      default: docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+  tasks:
+    - name: checkout
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: checkout
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)
+            computeResources:
+              requests:
+                cpu: 250m
+                memory: 512Mi
+              limits:
+                memory: 1Gi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              git -c advice.detachedHead=false clone --depth=1 --branch v3.18.6 https://github.com/helm/helm.git src
+              cd src
+              test "$(git rev-parse HEAD)" = b76a950f6835474e0906b96c9ec68a2eff3a6430
+              export GOPATH="$(workspaces.source.path)/go"
+              export GOMODCACHE="$(workspaces.source.path)/modules"
+              export GOCACHE="$(workspaces.source.path)/build-cache"
+              export GOTOOLCHAIN=local
+              time -p go mod download
+    - name: compile
+      runAfter: [checkout]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: compile
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)/src
+            computeResources:
+              requests:
+                cpu: "2"
+                memory: 2Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              export GOPATH="$(workspaces.source.path)/go"
+              export GOMODCACHE="$(workspaces.source.path)/modules"
+              export GOCACHE="$(workspaces.source.path)/build-cache"
+              export GOTOOLCHAIN=local GOMAXPROCS=2 GOPROXY=off
+              mkdir -p "$(workspaces.source.path)/out"
+              go version
+              time -p go build -mod=readonly -trimpath -o "$(workspaces.source.path)/out/helm" ./cmd/helm
+              if [[ -r /sys/fs/cgroup/memory.peak ]]; then
+                printf 'step_cgroup_peak_memory_bytes=%s\n' "$(cat /sys/fs/cgroup/memory.peak)"
+              fi
+    - name: test
+      runAfter: [compile]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: test
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)/src
+            computeResources:
+              requests:
+                cpu: "1"
+                memory: 1Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              export GOPATH="$(workspaces.source.path)/go"
+              export GOMODCACHE="$(workspaces.source.path)/modules"
+              export GOCACHE="$(workspaces.source.path)/build-cache"
+              export GOTOOLCHAIN=local GOMAXPROCS=2 GOPROXY=off
+              time -p go test -mod=readonly -count=1 ./pkg/chart ./pkg/lint
+    - name: package
+      runAfter: [test]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: package
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)/out
+            computeResources:
+              requests:
+                cpu: 250m
+                memory: 256Mi
+              limits:
+                memory: 512Mi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              tar -czf helm-bin.tar.gz helm
+              sha256sum helm-bin.tar.gz
+              printf 'artifact_bytes=%s\n' "$(wc -c < helm-bin.tar.gz)"
