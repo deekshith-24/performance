@@ -5,6 +5,11 @@ compiles the Helm CLI from source, runs selected unit tests, and packages the
 binary. Four sequential TaskRuns share a fresh 8 GiB workspace. Compile and test
 use the modules downloaded during checkout. The package stays in the workspace.
 
+Set `COMPILE_TASK_COUNT=12` to add four lightweight checks between checkout and
+compile and four between testing and packaging. Each group uses two parallel
+branches of two checks. Each check requests 100m CPU and 128 MiB of memory.
+The default `COMPILE_TASK_COUNT=4` uses the original four stages.
+
 Use a test cluster with OpenShift Pipelines, a default storage class that supports
 ReadWriteOnce claims, and access to the public source and dependency registries.
 The compiler image is pinned. The compile step requests and uses at most two

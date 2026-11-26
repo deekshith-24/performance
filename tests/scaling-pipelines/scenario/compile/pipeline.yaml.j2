@@ -1,3 +1,34 @@
+{% macro check(name, after, command) -%}
+    - name: {{ name }}
+      runAfter: [{{ after }}]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: check
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)
+            computeResources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                memory: 256Mi
+            script: |
+              #!/usr/bin/env sh
+              set -eu
+              {{ command }}
+              printf '%s\n' '{{ name }} passed'
+{%- endmacro %}
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
@@ -44,8 +75,18 @@ spec:
               export GOCACHE="$(workspaces.source.path)/build-cache"
               export GOTOOLCHAIN=local
               time -p go mod download
+{% if task_count == 12 %}
+    {{ check('check-source-layout', 'checkout', 'test -d src/.git') }}
+    {{ check('check-module-files', 'checkout', 'test -s src/go.mod && test -s src/go.sum') }}
+    {{ check('check-build-inputs', 'check-source-layout', 'test -d src/cmd/helm') }}
+    {{ check('check-module-cache', 'check-module-files', 'test -d modules/cache/download') }}
+{% endif %}
     - name: compile
+{% if task_count == 12 %}
+      runAfter: [check-build-inputs, check-module-cache]
+{% else %}
       runAfter: [checkout]
+{% endif %}
       params:
         - name: builder-image
           value: $(params.builder-image)
@@ -115,8 +156,18 @@ spec:
               export GOCACHE="$(workspaces.source.path)/build-cache"
               export GOTOOLCHAIN=local GOMAXPROCS=2 GOPROXY=off
               time -p go test -mod=readonly -count=1 ./pkg/chart ./pkg/lint
+{% if task_count == 12 %}
+    {{ check('check-binary', 'test', 'test -x out/helm') }}
+    {{ check('check-package-inputs', 'test', 'test -s src/LICENSE && test -w out') }}
+    {{ check('check-binary-version', 'check-binary', 'out/helm version --short') }}
+    {{ check('check-binary-checksum', 'check-package-inputs', 'sha256sum out/helm') }}
+{% endif %}
     - name: package
+{% if task_count == 12 %}
+      runAfter: [check-binary-version, check-binary-checksum]
+{% else %}
       runAfter: [test]
+{% endif %}
       params:
         - name: builder-image
           value: $(params.builder-image)
@@ -145,3 +196,4 @@ spec:
               tar -czf helm-bin.tar.gz helm
               sha256sum helm-bin.tar.gz
               printf 'artifact_bytes=%s\n' "$(wc -c < helm-bin.tar.gz)"
+
