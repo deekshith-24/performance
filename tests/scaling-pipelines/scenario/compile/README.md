@@ -1,14 +1,16 @@
 # Go compile pilot
 
-Each PipelineRun checks out a pinned Helm revision, downloads its Go modules,
-compiles the Helm CLI from source, runs selected unit tests, and packages the
-binary. Four sequential TaskRuns share a fresh 8 GiB workspace. Compile and test
-use the modules downloaded during checkout. The package stays in the workspace.
+Each PipelineRun uses one fresh 8 GiB workspace and runs six tasks:
 
-Set `COMPILE_TASK_COUNT=12` to add four lightweight checks between checkout and
-compile and four between testing and packaging. Each group uses two parallel
-branches of two checks. Each check requests 100m CPU and 128 MiB of memory.
-The default `COMPILE_TASK_COUNT=4` uses the original four stages.
+1. Check out a pinned Helm revision and download its Go modules.
+2. Compile the Helm CLI from source.
+3. Run `go vet` on the Helm CLI packages alongside the build.
+4. Run selected unit tests once the build finishes.
+5. Lint and render a sample chart with the built binary alongside the unit tests.
+6. Package the binary after the checks pass and record its size and checksum.
+
+The build and checks reuse the downloaded modules. The package and rendered
+manifests stay in the workspace.
 
 Use a test cluster with OpenShift Pipelines, a default storage class that supports
 ReadWriteOnce claims, and access to the public source and dependency registries.
@@ -28,6 +30,9 @@ time, user and system CPU time, and the step cgroup's memory peak when available
 The package step logs its size and checksum. The harness keeps the PipelineRuns,
 TaskRuns, and their workspaces for inspection.
 
+With Results enabled, `ci-scripts/collect-results.sh` includes Watcher workqueue
+and API request metrics in `benchmark-tekton.json` and the raw monitoring CSVs.
+
 For a time-boxed capacity test on a dedicated benchmark cluster, use
 `TOTAL_TIMEOUT=3600`, `TEST_NAMESPACE=5`, and `TEST_CONCURRENT=10` or `16`.
 Each namespace replenishes completed runs up to its concurrency limit. With
@@ -35,6 +40,6 @@ Each namespace replenishes completed runs up to its concurrency limit. With
 five-minute TTL or `COMPILE_PRUNER_MODE=soft` for a CronJob that keeps 30 runs per
 resource every five minutes. Both modes allow in-flight runs to finish and wait
 five more minutes before collecting the PostgreSQL snapshot.
-With Chains HA configured, it prepares signing and waits for the Chains replicas
-before starting load. Count successful completions within the test window
+Timed downstream Results runs prepare Chains signing and wait for the configured
+replica count before starting load. Count successful completions within the test window
 separately from completions after the cutoff.

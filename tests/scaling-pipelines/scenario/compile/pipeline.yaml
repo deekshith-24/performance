@@ -1,34 +1,3 @@
-{% macro check(name, after, command) -%}
-    - name: {{ name }}
-      runAfter: [{{ after }}]
-      params:
-        - name: builder-image
-          value: $(params.builder-image)
-      workspaces:
-        - name: source
-          workspace: source
-      taskSpec:
-        params:
-          - name: builder-image
-            type: string
-        workspaces:
-          - name: source
-        steps:
-          - name: check
-            image: $(params.builder-image)
-            workingDir: $(workspaces.source.path)
-            computeResources:
-              requests:
-                cpu: 100m
-                memory: 128Mi
-              limits:
-                memory: 256Mi
-            script: |
-              #!/usr/bin/env sh
-              set -eu
-              {{ command }}
-              printf '%s\n' '{{ name }} passed'
-{%- endmacro %}
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
@@ -75,18 +44,8 @@ spec:
               export GOCACHE="$(workspaces.source.path)/build-cache"
               export GOTOOLCHAIN=local
               time -p go mod download
-{% if task_count == 12 %}
-    {{ check('check-source-layout', 'checkout', 'test -d src/.git') }}
-    {{ check('check-module-files', 'checkout', 'test -s src/go.mod && test -s src/go.sum') }}
-    {{ check('check-build-inputs', 'check-source-layout', 'test -d src/cmd/helm') }}
-    {{ check('check-module-cache', 'check-module-files', 'test -d modules/cache/download') }}
-{% endif %}
     - name: compile
-{% if task_count == 12 %}
-      runAfter: [check-build-inputs, check-module-cache]
-{% else %}
       runAfter: [checkout]
-{% endif %}
       params:
         - name: builder-image
           value: $(params.builder-image)
@@ -123,6 +82,39 @@ spec:
               if [[ -r /sys/fs/cgroup/memory.peak ]]; then
                 printf 'step_cgroup_peak_memory_bytes=%s\n' "$(cat /sys/fs/cgroup/memory.peak)"
               fi
+    - name: vet
+      runAfter: [checkout]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: vet
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)/src
+            computeResources:
+              requests:
+                cpu: "1"
+                memory: 1Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              export GOPATH="$(workspaces.source.path)/go"
+              export GOMODCACHE="$(workspaces.source.path)/modules"
+              export GOCACHE="$(workspaces.source.path)/build-cache"
+              export GOTOOLCHAIN=local GOMAXPROCS=2 GOPROXY=off
+              time -p go vet -mod=readonly ./cmd/helm/...
     - name: test
       runAfter: [compile]
       params:
@@ -156,18 +148,40 @@ spec:
               export GOCACHE="$(workspaces.source.path)/build-cache"
               export GOTOOLCHAIN=local GOMAXPROCS=2 GOPROXY=off
               time -p go test -mod=readonly -count=1 ./pkg/chart ./pkg/lint
-{% if task_count == 12 %}
-    {{ check('check-binary', 'test', 'test -x out/helm') }}
-    {{ check('check-package-inputs', 'test', 'test -s src/LICENSE && test -w out') }}
-    {{ check('check-binary-version', 'check-binary', 'out/helm version --short') }}
-    {{ check('check-binary-checksum', 'check-package-inputs', 'sha256sum out/helm') }}
-{% endif %}
+    - name: smoke-test
+      runAfter: [compile]
+      params:
+        - name: builder-image
+          value: $(params.builder-image)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: builder-image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: smoke-test
+            image: $(params.builder-image)
+            workingDir: $(workspaces.source.path)/out
+            computeResources:
+              requests:
+                cpu: 250m
+                memory: 256Mi
+              limits:
+                memory: 512Mi
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              chart_dir="$(mktemp -d)/benchmark-chart"
+              ./helm create "$chart_dir"
+              ./helm lint --strict "$chart_dir"
+              ./helm template benchmark "$chart_dir" > smoke-manifests.yaml
+              grep -q '^kind: Deployment$' smoke-manifests.yaml
     - name: package
-{% if task_count == 12 %}
-      runAfter: [check-binary-version, check-binary-checksum]
-{% else %}
-      runAfter: [test]
-{% endif %}
+      runAfter: [vet, test, smoke-test]
       params:
         - name: builder-image
           value: $(params.builder-image)
