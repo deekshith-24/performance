@@ -119,8 +119,12 @@ function capture_results_db_query(){
     local output_file=$5
 
     local result
-    result=$(oc -n openshift-pipelines exec -i tekton-results-postgres-0 -- bash -c "PGPASSWORD=$pg_pwd psql -d $pg_db -U $pg_user -c \"SELECT json_agg(t) from ($query) t\" --tuples-only --no-align ")
-    
+    if ! result=$(oc -n openshift-pipelines exec -i tekton-results-postgres-0 -- \
+        env "PGPASSWORD=$pg_pwd" psql -X -v ON_ERROR_STOP=1 -d "$pg_db" -U "$pg_user" \
+        --tuples-only --no-align -c "SELECT json_agg(t) FROM ($query) t"); then
+        return 1
+    fi
+
     if [ -z "$result" ]; then
         warning "No results found or query failed."
         return

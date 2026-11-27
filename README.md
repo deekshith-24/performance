@@ -43,6 +43,12 @@ Setup the OpenShift cluster (assuming `oc login ...` happened already):
     # export DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE="deployments"  # deployments or statefulSets; statefulSets enables StatefulSet ordinals
     # export DEPLOYMENT_RESULTS_WATCHER_DISABLE_STORING_INCOMPLETE_RUNS="true"  # Disable storing incomplete runs (improves performance)
     # Results Watcher HA and StatefulSet settings are experimental; validate them against the installed Results/operator version.
+    # Results API (optional; empty keeps product defaults: 1 replica, QPS 5, burst 10)
+    # export DEPLOYMENT_RESULTS_API_AUTH_DISABLE="false"  # Enable authentication; also export for load-test.sh
+    # export DEPLOYMENT_RESULTS_API_HA_REPLICAS="5"
+    # export DEPLOYMENT_RESULTS_API_KUBE_API_QPS="50"
+    # export DEPLOYMENT_RESULTS_API_KUBE_API_BURST="100"
+    # Collect: set VERIFY_RESULTS_INGESTION=true to run the slow UID/log verification gate (default false).
 
 
     # export DEPLOYMENT_VERSION="1.14"

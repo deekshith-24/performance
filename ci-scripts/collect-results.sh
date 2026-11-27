@@ -34,6 +34,7 @@ mkdir -p "${monitoring_collection_dir}"
 [ -f tests/scaling-pipelines/imagestreamtags.json ] && mv tests/scaling-pipelines/imagestreamtags.json "${ARTIFACT_DIR}/"
 [ -f tests/scaling-pipelines/measure-signed.csv ] && mv tests/scaling-pipelines/measure-signed.csv "${ARTIFACT_DIR}/"
 [ -f tests/scaling-pipelines/locust-test.log ] && mv tests/scaling-pipelines/locust-test.log "${ARTIFACT_DIR}/"
+[ -f tests/scaling-pipelines/locust-after-load.jsonl ] && mv tests/scaling-pipelines/locust-after-load.jsonl "${ARTIFACT_DIR}/"
 [ -f tests/scaling-pipelines/locust-concurrent.json ] && mv tests/scaling-pipelines/locust-concurrent.json "${ARTIFACT_DIR}/"
 if [ -d tests/scaling-pipelines/locust-concurrent ]; then
     mkdir -p "${ARTIFACT_DIR}/locust-concurrent"
@@ -164,6 +165,45 @@ if [ "$INSTALL_RESULTS" == "true" ]; then
     pg_user=$(oc -n openshift-pipelines get secret tekton-results-postgres -o json | jq -r '.data.POSTGRES_USER' | base64 -d)
     pg_pwd=$(oc -n openshift-pipelines get secret tekton-results-postgres -o json | jq -r '.data.POSTGRES_PASSWORD' | base64 -d)
 
+    # Session counts describe the capture instant. Database counters cover the
+    # period since stats_reset. Collect before the dump opens a connection.
+    info "Collecting PostgreSQL connection and database statistics"
+    postgres_stats_query=$(cat <<'SQL'
+SELECT statement_timestamp() AS captured_at,
+       current_setting('max_connections')::integer AS server_max_connections,
+       sessions.*,
+       db.stats_reset AS statistics_reset_at,
+       db.xact_commit AS cumulative_transactions_committed,
+       db.xact_rollback AS cumulative_transactions_rolled_back,
+       db.blks_read AS cumulative_blocks_read,
+       db.blks_hit AS cumulative_buffer_cache_hits,
+       db.tup_inserted AS cumulative_rows_inserted,
+       db.tup_updated AS cumulative_rows_updated,
+       db.temp_files AS cumulative_temp_files,
+       db.temp_bytes AS cumulative_temp_bytes,
+       db.deadlocks AS cumulative_deadlocks,
+       current_setting('track_io_timing')::boolean AS io_timing_enabled,
+       CASE WHEN current_setting('track_io_timing')::boolean THEN db.blk_read_time END AS cumulative_block_read_ms,
+       CASE WHEN current_setting('track_io_timing')::boolean THEN db.blk_write_time END AS cumulative_block_write_ms
+FROM pg_stat_database AS db
+CROSS JOIN (
+    SELECT count(*) AS server_client_connections,
+           count(*) FILTER (WHERE datname = current_database()) AS results_client_connections,
+           count(*) FILTER (WHERE datname = current_database() AND state = 'active') AS results_active_connections,
+           count(*) FILTER (
+               WHERE datname = current_database() AND state IN ('idle in transaction', 'idle in transaction (aborted)')
+           ) AS results_idle_in_transaction_connections,
+           count(*) FILTER (WHERE datname = current_database() AND wait_event_type = 'Lock') AS results_lock_waiting_connections
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+) AS sessions
+WHERE db.datname = current_database()
+SQL
+    )
+    if ! capture_results_db_query "$pg_user" "$pg_pwd" "tekton-results" "$postgres_stats_query" "$monitoring_collection_data"; then
+        warning "PostgreSQL connection and database statistics unavailable"
+    fi
+
     # Dump Postgres Database
     oc -n openshift-pipelines exec -i tekton-results-postgres-0 -- bash -c "PGPASSWORD=$pg_pwd pg_dump --format=c tekton-results -U $pg_user --file=/tmp/pg_data.dump"
 
@@ -237,6 +277,11 @@ if results:
         fi
     else
         warning "Locust log file not found, skipping Locust summary"
+    fi
+    if [ -s "$ARTIFACT_DIR/locust-after-load.jsonl" ]; then
+        jq --slurpfile windows "$ARTIFACT_DIR/locust-after-load.jsonl" \
+            '.results.ResultsAPIAfterLoad = $windows' "$monitoring_collection_data" \
+            > "${monitoring_collection_data}.tmp" && mv "${monitoring_collection_data}.tmp" "$monitoring_collection_data"
     fi
 else
     info "Skipping Results-API log data"

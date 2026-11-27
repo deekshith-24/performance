@@ -327,3 +327,36 @@ if [[ "$ingestion_json" != "null" ]]; then
 else
     echo "DEBUG: No ingested ${type} found. Skipping ingestion metrics..."
 fi
+
+# Use the load-window cohort. The acknowledgement time is when the benchmark
+# observed a stored=true transition on a terminal object.
+if ! jq --arg type "$type" --arg started "$started" --arg ended "$ended" --slurpfile runs "$input" '
+    def epoch:
+        if type == "string" and test("(Z|\\+00:00)$") then
+            try (((.[0:19] + "Z") | fromdate) +
+                (("0." + (capture("[.,](?<fraction>[0-9]+)").fraction // "0")) | tonumber)) catch null
+        else null end;
+    def percentile($p):
+        if length > 0 then .[(length * $p | ceil) - 1] * 1000 | round / 1000 else null end;
+    def distribution:
+        sort | {samples: length, p50: percentile(0.5), p95: percentile(0.95), p99: percentile(0.99)};
+    def elapsed($start; $end):
+        if $start != null and $end != null and $end >= $start then $end - $start else empty end;
+
+    ($started | epoch) as $start | ($ended | epoch) as $end |
+    if $start == null or $end == null then error("Missing load-window timestamps") else . end |
+    [$runs[0][$type | ascii_downcase][]? | (.completionTime | epoch) as $completed |
+        select($completed != null and $completed >= $start and $completed <= $end)] as $completed_runs |
+    [$completed_runs[] | select(.outcome == "succeeded") |
+        {task: .pipeline_task, duration: elapsed((.creationTimestamp | epoch); (.completionTime | epoch))}] as $durations |
+    .results[$type].timing = {
+        successful_duration_seconds: ([$durations[].duration] | distribution),
+        successful_task_duration_seconds: ([$durations[] | select(.task != null)] | group_by(.task) |
+            map({key: .[0].task, value: ([.[].duration] | distribution)}) | from_entries),
+        completed_to_observed_storage_ack_seconds: (
+            [$completed_runs[] | elapsed((.completionTime | epoch); (.terminal_result_stored_at | epoch))] | distribution),
+        completed_runs: ($completed_runs | length)
+    }
+' "$output" > "$$.json" || ! mv -f "$$.json" "$output"; then
+    echo "WARNING: Could not summarize timing for ${type}" >&2
+fi

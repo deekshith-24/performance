@@ -2,6 +2,7 @@
 """Cycle Results read workloads during this scenario's ingestion window."""
 
 import argparse
+from bisect import bisect_left
 from datetime import datetime, timezone
 import json
 from itertools import cycle
@@ -14,6 +15,7 @@ import sys
 import time
 
 ARTIFACT = Path("locust-concurrent.json")
+AFTER_LOAD_ARTIFACT = Path("locust-after-load.jsonl")
 LOG = Path("locust-test.log")
 LOG_DIR = Path("locust-concurrent")
 # Reserve time for operator/pod startup and cleanup when admitting another run.
@@ -67,7 +69,8 @@ def settings(env):
     return dict(scenarios=list(ENDPOINTS), duration=duration, duration_seconds=seconds,
                 start_delay_seconds=delay, stop_before_end_seconds=stop_before,
                 ingestion_seconds=total,
-                users=users, workers=workers, spawn_rate=spawn)
+                users=users, workers=workers, spawn_rate=spawn,
+                authentication_enabled=env.get("DEPLOYMENT_RESULTS_API_AUTH_DISABLE") == "false")
 
 
 def save(state):
@@ -94,7 +97,8 @@ def read_result(log, scenario, config):
     # Locust container timestamps use UTC. Retain the actual read window for overlap checks.
     started = datetime.strptime(start[1], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc)
     ended = datetime.strptime(shutdown[-1][1], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc)
-    if (ended - started).total_seconds() < config["duration_seconds"] - 2:
+    elapsed = (ended - started).total_seconds()
+    if elapsed < config["duration_seconds"] - 2:
         raise ValueError("Locust stopped before the configured duration")
     percentiles = re.search(
         r"^GET\s+" + endpoint + r"\s+((?:[\d.]+\s+){10}[\d.]+)\s+(\d+)\s*$", final, re.M)
@@ -108,6 +112,7 @@ def read_result(log, scenario, config):
         r"(?:All users spawned|Spawning is complete and report waittime is expired[^\n]*):"
         r"[^\n]*\((\d+) total users\)", log)
     return dict(read_started_at=started.isoformat(), read_ended_at=ended.isoformat(),
+                read_elapsed_seconds=elapsed,
                 user_count_verified=bool(reported and int(reported[-1]) == config["users"]),
                 ramp_up_reported_users=int(reported[-1]) if reported else None,
                 requests=int(row[1]), failed_requests=int(row[2]),
@@ -115,11 +120,50 @@ def read_result(log, scenario, config):
                 requests_per_second=float(row[7]), latency_ms=latency)
 
 
+def record_after_load(log_path, scenario, env, log_stream_exit_code):
+    """Retain each quiet-period read window while preserving its validation."""
+    result = dict(scenario=scenario, endpoint=ENDPOINTS[scenario], duration=env["LOCUST_DURATION"],
+                  users=int(env["LOCUST_USERS"]), workers=int(env["LOCUST_WORKERS"]),
+                  spawn_rate=float(env["LOCUST_SPAWN_RATE"]),
+                  authentication_enabled=env["RESULTS_AUTH_ENABLED"] == "true",
+                  log_stream_exit_code=log_stream_exit_code)
+    validation_error = None
+    try:
+        duration = re.fullmatch(r"([1-9][0-9]*)([hms]?)", result["duration"])
+        if not duration:
+            raise ValueError("Locust duration must be a positive duration such as 5m or 300s")
+        result["duration_seconds"] = int(duration[1]) * {"h": 3600, "m": 60, "s": 1, "": 1}[duration[2]]
+        result.update(read_result(log_path.read_text(), scenario, result))
+        if result["locust_exit_code"] or result["total_failed_requests"] or not result["user_count_verified"]:
+            raise ValueError(f"{result['total_failed_requests']} failed requests, "
+                             f"exit={result['locust_exit_code']}, users verified={result['user_count_verified']}")
+        result["status"] = "completed"
+    except (OSError, ValueError) as exc:
+        validation_error = str(exc)
+        result.update(status="failed", error=validation_error)
+    if log_stream_exit_code and not validation_error:
+        result.update(status="failed", error=f"Locust master log stream exited with code {log_stream_exit_code}")
+
+    try:
+        with AFTER_LOAD_ARTIFACT.open("a") as output:
+            output.write(json.dumps(result) + "\n")
+    except OSError as exc:
+        print(f"Locust summary could not be saved: {exc}", file=sys.stderr)
+
+    if validation_error is not None:
+        raise ValueError(validation_error)
+
+
 def verify_overlap():
     state = json.loads(ARTIFACT.read_text())
-    runs = json.loads(Path("benchmark-output.json").read_text())["pipelineruns"]
-    created = [timestamp(run["creationTimestamp"]) for run in runs.values()
+    observed = json.loads(Path("benchmark-output.json").read_text())
+    created = [timestamp(run["creationTimestamp"]) for run in observed["pipelineruns"].values()
                if run.get("creationTimestamp")]
+    completions = {
+        kind: sorted(timestamp(run["completionTime"]) for run in observed[kind].values()
+                     if run.get("outcome") == "succeeded" and run.get("completionTime"))
+        for kind in ("pipelineruns", "taskruns") if kind in observed
+    }
     for iteration in state["iterations"]:
         start = timestamp(iteration["read_started_at"]) if iteration.get("read_started_at") else None
         end = timestamp(iteration["read_ended_at"]) if iteration.get("read_ended_at") else None
@@ -129,6 +173,8 @@ def verify_overlap():
             boundaries = [start] + during + [end]
             iteration["max_pipeline_creation_gap_seconds"] = max(
                 right - left for left, right in zip(boundaries, boundaries[1:]))
+            for kind, times in completions.items():
+                iteration[kind + "_succeeded_during_read"] = bisect_left(times, end) - bisect_left(times, start)
         iteration["overlap_verified"] = bool(
             during and min(created) <= start < end <= max(created)
             and end <= timestamp(state["read_cutoff_at"])

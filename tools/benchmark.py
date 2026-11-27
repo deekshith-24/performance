@@ -312,6 +312,7 @@ def process_events_thread(watcher, data, lock, capture_finalizers=False):
             # Collect metadata and timestamps if we do not have it already
             for path in [
                 "object.metadata.namespace",
+                "object.metadata.uid",
                 "object.metadata.creationTimestamp",
                 "object.metadata.deletionTimestamp",
                 "object.status.startTime",
@@ -325,6 +326,11 @@ def process_events_thread(watcher, data, lock, capture_finalizers=False):
                         pass
                     else:
                         data[e_name][name] = response
+
+            labels = event["object"]["metadata"].get("labels") or {}
+            pipeline_task = labels.get("tekton.dev/pipelineTask")
+            if pipeline_task:
+                data[e_name].setdefault("pipeline_task", pipeline_task)
 
             # Determine state and possibly outcome
             try:
@@ -386,6 +392,13 @@ def process_events_thread(watcher, data, lock, capture_finalizers=False):
                     if annotation in annotations:
                         if key + "_at" not in data[e_name]:
                             data[e_name][key + "_at"] = now()
+                        if (
+                            key == "result_stored"
+                            and annotations[annotation] == "true"
+                            and data[e_name].get("completionTime")
+                            and data[e_name].get(key) != "true"
+                        ):
+                            data[e_name].setdefault("terminal_result_stored_at", now())
                         data[e_name][key] = annotations[annotation]
 
             if capture_finalizers:

@@ -400,10 +400,10 @@ function run_locust() {
 
         if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "after-load" ]; then
             # A successful kubectl log stream does not imply a successful Locust test.
-            if ! python3 - "$locust_run_log" "$SCENARIO" "$LOCUST_DURATION" "$LOCUST_USERS" <<'PY'
+            if ! python3 - "$locust_run_log" "$SCENARIO" "$locust_log_status" <<'PY'
 import importlib.util
+import os
 from pathlib import Path
-import re
 import sys
 
 spec = importlib.util.spec_from_file_location(
@@ -411,14 +411,8 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 try:
-    duration = re.fullmatch(r"([1-9][0-9]*)([hms]?)", sys.argv[3])
-    seconds = int(duration[1]) * {"h": 3600, "m": 60, "s": 1, "": 1}[duration[2]]
-    result = module.read_result(Path(sys.argv[1]).read_text(), sys.argv[2],
-                                {"duration_seconds": seconds, "users": int(sys.argv[4])})
-    if result["locust_exit_code"] or result["total_failed_requests"] or not result["user_count_verified"]:
-        raise ValueError(f"{result['total_failed_requests']} failed requests; "
-                         f"exit={result['locust_exit_code']}; users verified={result['user_count_verified']}")
-except (ValueError, TypeError) as exc:
+    module.record_after_load(Path(sys.argv[1]), sys.argv[2], os.environ, int(sys.argv[3]))
+except ValueError as exc:
     sys.exit(f"Locust {sys.argv[2]} failed: {exc}")
 PY
             then

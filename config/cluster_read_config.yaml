@@ -138,9 +138,25 @@
   monitoring_query: sum(rate(apiserver_request_total{}[5m]))
   monitoring_step: 15
 
+- name: measurements.apiserver_throttled_requests_per_second
+  monitoring_query: sum(rate(apiserver_request_total{code="429"}[2m]))
+  monitoring_step: 15
+
+- name: measurements.apiserver_tekton_run_write_latency_p95_seconds
+  monitoring_query: |
+    histogram_quantile(0.95, sum by (le) (rate(apiserver_request_duration_seconds_bucket{group="tekton.dev",resource=~"pipelineruns|taskruns",verb=~"CREATE|UPDATE|PATCH|DELETE"}[2m]))) >= 0
+  monitoring_step: 15
+
 - name: measurements.etcd_request_duration_seconds_average
   monitoring_query: sum(rate(etcd_request_duration_seconds_sum{}[5m])) / sum(rate(etcd_request_duration_seconds_count[5m]))
   monitoring_step: 15
+
+{% for operation in ['wal_fsync', 'backend_commit'] %}
+- name: measurements.etcd_disk_{{ operation }}_worst_member_p99_seconds
+  monitoring_query: |
+    max(histogram_quantile(0.99, sum by (instance, le) (rate(etcd_disk_{{ operation }}_duration_seconds_bucket[5m]))) >= 0)
+  monitoring_step: 15
+{% endfor %}
 
 - name: measurements.etcd_mvcc_db_total_size_in_bytes_average
   monitoring_query: avg(etcd_mvcc_db_total_size_in_bytes)
@@ -157,6 +173,7 @@
 # Interesting CI environment variables
 {% for var in [
   'BUILD_ID',
+  'COMPILE_PRUNER_MODE',
   'DEPLOYMENT_TYPE',
   'DEPLOYMENT_VERSION',
   'NIGHTLY_BUILD',
@@ -165,6 +182,16 @@
   'DEPLOYMENT_CHAINS_CONTROLLER_HA_REPLICAS',
   'DEPLOYMENT_RESOLVERS_HA_REPLICAS',
   'DEPLOYMENT_RESOLVERS_CACHE_MODE',
+  'DEPLOYMENT_RESULTS_API_AUTH_DISABLE',
+  'DEPLOYMENT_RESULTS_API_HA_REPLICAS',
+  'DEPLOYMENT_RESULTS_API_KUBE_API_QPS',
+  'DEPLOYMENT_RESULTS_API_KUBE_API_BURST',
+  'DEPLOYMENT_RESULTS_WATCHER_CONTROLLER_TYPE',
+  'DEPLOYMENT_RESULTS_WATCHER_DISABLE_STORING_INCOMPLETE_RUNS',
+  'DEPLOYMENT_RESULTS_WATCHER_HA_REPLICAS',
+  'DEPLOYMENT_RESULTS_WATCHER_KUBE_API_QPS',
+  'DEPLOYMENT_RESULTS_WATCHER_KUBE_API_BURST',
+  'DEPLOYMENT_RESULTS_WATCHER_THREADINESS',
   'HOSTNAME',
   'JOB_NAME',
   'OPENSHIFT_API',
@@ -178,9 +205,13 @@
   'REPO_NAME',
   'REPO_OWNER',
   'TEST_CONCURRENT',
+  'TEST_NAMESPACE',
   'TEST_SCENARIO',
   'TEST_TOTAL',
   'TEST_DO_CLEANUP',
+  'TOTAL_TIMEOUT',
+  'RUN_LOCUST',
+  'LOCUST_RUN_PHASE',
   'LOCUST_USERS',
   'LOCUST_WORKERS',
 ] %}
@@ -270,11 +301,29 @@
 {% if INSTALL_RESULTS == 'true' %}
 {% set watcher_labels = 'namespace=~"openshift-pipelines|tekton-pipelines",pod=~"tekton-results-watcher-.+"' %}
 {% set api_labels = 'namespace=~"openshift-pipelines|tekton-pipelines",pod=~"tekton-results-api-.+",grpc_service=~"tekton[.]results[.].+[.](Results|Logs)"' %}
+{% set review_labels = 'resource=~"tokenreviews|subjectaccessreviews|selfsubjectaccessreviews|localsubjectaccessreviews",verb="CREATE"' %}
+# Cluster-wide review traffic helps diagnose Results authentication and authorization.
+- name: measurements.apiserver_auth_review_requests_per_second
+  monitoring_query: sum(rate(apiserver_request_total{ {{ review_labels }} }[2m]))
+  monitoring_step: 15
+- name: measurements.apiserver_auth_review_throttled_requests_per_second
+  monitoring_query: sum(rate(apiserver_request_total{ {{ review_labels }},code="429" }[2m]))
+  monitoring_step: 15
+- name: measurements.apiserver_auth_review_latency_p95_seconds
+  monitoring_query: |
+    histogram_quantile(0.95, sum by (le) (rate(apiserver_request_duration_seconds_bucket{ {{ review_labels }} }[2m]))) >= 0
+  monitoring_step: 15
+
 # Results uses watcher_* on OpenCensus and kn_* on OpenTelemetry for workqueues.
 - name: measurements.tekton-results-watcher.workqueue_depth
   monitoring_query: |
     sum(watcher_workqueue_depth{ {{ watcher_labels }} })
     or sum(kn_workqueue_depth{ {{ watcher_labels }} })
+  monitoring_step: 15
+- name: measurements.tekton-results-watcher.busiest_pod_workqueue_depth
+  monitoring_query: |
+    max(sum by (namespace, pod) (watcher_workqueue_depth{ {{ watcher_labels }} }))
+    or max(sum by (namespace, pod) (kn_workqueue_depth{ {{ watcher_labels }} }))
   monitoring_step: 15
 - name: measurements.tekton-results-watcher.workqueue_wait_p95_seconds
   monitoring_query: |
@@ -304,6 +353,24 @@
   monitoring_query: |
     histogram_quantile(0.95, sum by (le) (rate(grpc_server_handling_seconds_bucket{ {{ api_labels }} }[2m]))) >= 0
   monitoring_step: 15
+
+# The collector accepts one series per measurement. Keep individual method
+# names in a bounded list for the writes and reads exercised by the tests.
+{% for method in ['CreateResult', 'UpdateResult', 'CreateRecord', 'UpdateRecord', 'GetRecord', 'ListRecords', 'GetLog'] %}
+{% set method_labels = api_labels ~ ',grpc_method="' ~ method ~ '"' %}
+- name: measurements.tekton-results-api.rpc.{{ method }}.completed_per_second
+  monitoring_query: sum(rate(grpc_server_handled_total{ {{ method_labels }} }[2m]))
+  monitoring_step: 15
+- name: measurements.tekton-results-api.rpc.{{ method }}.non_ok_per_second
+  monitoring_query: |
+    sum(rate(grpc_server_handled_total{ {{ method_labels }},grpc_code!="OK" }[2m]))
+    or 0 * sum(rate(grpc_server_handled_total{ {{ method_labels }} }[2m]))
+  monitoring_step: 15
+- name: measurements.tekton-results-api.rpc.{{ method }}.handling_p95_seconds
+  monitoring_query: |
+    histogram_quantile(0.95, sum by (le) (rate(grpc_server_handling_seconds_bucket{ {{ method_labels }} }[2m]))) >= 0
+  monitoring_step: 15
+{% endfor %}
 {% endif %}
 
 # PostgreSQL pod resources and persistent-volume occupancy. Database/table sizes
@@ -311,6 +378,11 @@
 {{ cluster_read_library.monitor_pod(namespace, 'tekton-results-postgres', 15) }}
 - name: measurements.tekton-results-postgres.memory_working_set_bytes
   monitoring_query: sum(container_memory_working_set_bytes{namespace='{{ namespace }}',pod=~'tekton-results-postgres-.+',container!='',container!='POD'})
+  monitoring_step: 15
+- name: measurements.tekton-results-postgres.cpu_throttled_period_ratio
+  monitoring_query: |
+    (sum(rate(container_cpu_cfs_throttled_periods_total{namespace="{{ namespace }}",pod=~"tekton-results-postgres-.+",container!="",container!="POD"}[2m]))
+    / sum(rate(container_cpu_cfs_periods_total{namespace="{{ namespace }}",pod=~"tekton-results-postgres-.+",container!="",container!="POD"}[2m]))) >= 0
   monitoring_step: 15
 - name: measurements.tekton-results-postgres.volume_used_bytes
   monitoring_query: sum(kubelet_volume_stats_used_bytes{namespace='{{ namespace }}',persistentvolumeclaim=~'.*tekton-results-postgres.*'})
@@ -404,6 +476,20 @@
 - name: measurements.logs.loki.distributor_lines_received
   monitoring_query: sum(loki_distributor_lines_received_total)
   monitoring_step: 15
+
+# Loki may create a discard series only once it sees a rejection.
+{% set loki_ingest_labels = 'namespace="openshift-logging",pod=~"logging-loki-(distributor|ingester)-.+"' %}
+- name: measurements.logs.loki.discarded_lines_per_second
+  monitoring_query: sum(rate(loki_discarded_samples_total{ {{ loki_ingest_labels }} }[2m]))
+  monitoring_step: 15
+- name: measurements.logs.loki.discarded_bytes_per_second
+  monitoring_query: sum(rate(loki_discarded_bytes_total{ {{ loki_ingest_labels }} }[2m]))
+  monitoring_step: 15
+{% for reason in ['rate_limited', 'per_stream_rate_limit', 'stream_limit', 'line_too_long'] %}
+- name: measurements.logs.loki.discarded_bytes_per_second_by_reason.{{ reason }}
+  monitoring_query: sum(rate(loki_discarded_bytes_total{ {{ loki_ingest_labels }},reason="{{ reason }}" }[2m]))
+  monitoring_step: 15
+{% endfor %}
 - name: measurements.logs.loki.distributor_ingester_appends
   monitoring_query: sum(loki_distributor_ingester_appends_total)
   monitoring_step: 15

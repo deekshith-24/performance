@@ -25,6 +25,9 @@ fi
 if [ "${LOCUST_RUN_PHASE:-after-load}" == after-load ]; then
     # Existing quiet-period tests; concurrent mode has already cycled all three.
     wait_for_timeout "$LOCUST_WAIT_TIME" "start Locust test"
+    if [ "${RUN_LOCUST:-false}" == "true" ]; then
+        : > locust-after-load.jsonl
+    fi
     after_load_locust_status=0
     for locust_scenario in fetch-log fetch-record fetch-all-records; do
         # Retain all three measurements even when an earlier endpoint fails.
