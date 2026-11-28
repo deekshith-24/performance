@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cycle Results read workloads during this scenario's ingestion window."""
+"""Run Results read workloads during the ingestion window."""
 
 import argparse
 from bisect import bisect_left
@@ -49,7 +49,9 @@ def settings(env):
     if env.get("RUN_LOCUST") != "true":
         raise ValueError("Concurrent reads require RUN_LOCUST=true")
     if env.get("LOCUST_SCENARIO"):
-        raise ValueError("Remove LOCUST_SCENARIO: concurrent mode now cycles all three read workloads")
+        raise ValueError("Remove LOCUST_SCENARIO: the test scenario selects the read workload")
+    repeat_cycles = env.get("TEST_SCENARIO") != "compile"
+    scenarios = list(ENDPOINTS)
     duration = env.get("LOCUST_DURATION", "5m")
     match = re.fullmatch(r"([1-9][0-9]*)([hms]?)", duration)
     if not match:
@@ -63,10 +65,10 @@ def settings(env):
     spawn = int(env.get("LOCUST_SPAWN_RATE", "10"))
     if min(delay, stop_before) < 0 or min(users, workers, spawn) <= 0 or workers > users:
         raise ValueError("Invalid warm-up, user count, worker count or spawn rate")
-    if delay + len(ENDPOINTS) * iteration_budget(seconds) >= total - stop_before:
-        raise ValueError("TOTAL_TIMEOUT must fit warm-up, one full three-scenario cycle "
+    if delay + len(scenarios) * iteration_budget(seconds) >= total - stop_before:
+        raise ValueError("TOTAL_TIMEOUT must fit warm-up, one round of the selected reads "
                          "with startup/cleanup allowances, and LOCUST_STOP_BEFORE_END")
-    return dict(scenarios=list(ENDPOINTS), duration=duration, duration_seconds=seconds,
+    return dict(scenarios=scenarios, repeat_cycles=repeat_cycles, duration=duration, duration_seconds=seconds,
                 start_delay_seconds=delay, stop_before_end_seconds=stop_before,
                 ingestion_seconds=total,
                 users=users, workers=workers, spawn_rate=spawn,
@@ -377,7 +379,8 @@ def run(config, parent_pid):
             check_parent()
             time.sleep(1)
         state["status"] = "running"
-        for scenario in cycle(config["scenarios"]):
+        scenarios = cycle(config["scenarios"]) if config["repeat_cycles"] else config["scenarios"]
+        for scenario in scenarios:
             check_parent()
             if time.time() + iteration_budget(config["duration_seconds"]) >= cutoff:
                 state["stop_reason"] = "Insufficient time for another full iteration before the read cutoff"

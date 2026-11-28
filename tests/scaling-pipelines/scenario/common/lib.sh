@@ -308,6 +308,38 @@ function oc_apply_manifest() {
     oc apply -f "scenario/$TEST_SCENARIO/${manifest}"
 }
 
+function concurrent_locust_cleanup() {
+    local status=$?
+    if [ -n "${CONCURRENT_LOCUST_PID:-}" ]; then
+        if jobs -pr | grep -qx "$CONCURRENT_LOCUST_PID"; then
+            kill "$CONCURRENT_LOCUST_PID" 2>/dev/null || true
+        fi
+        wait "$CONCURRENT_LOCUST_PID" 2>/dev/null || true
+    fi
+    return "$status"
+}
+
+function start_concurrent_locust() {
+    # Finish background cleanup before the outer CI process collects artifacts.
+    CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP=$(trap -p EXIT)
+    trap concurrent_locust_cleanup EXIT
+    python3 scenario/timebased-sign-pruner/concurrent-locust.py --parent-pid "$$" &
+    CONCURRENT_LOCUST_PID=$!
+    info "Concurrent Locust coordinator started (PID $CONCURRENT_LOCUST_PID)"
+}
+
+function finish_concurrent_locust() {
+    local status=0
+    wait "$CONCURRENT_LOCUST_PID" || status=$?
+    CONCURRENT_LOCUST_PID=""
+    python3 scenario/timebased-sign-pruner/concurrent-locust.py --verify-overlap || status=$?
+    trap - EXIT
+    if [ -n "$CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP" ]; then
+        eval "$CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP"
+    fi
+    return "$status"
+}
+
 function run_locust() {
     # Runs Locust API load test on cluster
     if [ "$RUN_LOCUST" == "true" ]; then
@@ -342,11 +374,16 @@ function run_locust() {
         cleanup_locust "$SCENARIO" || return $?
 
         # Create a ConfigMap from the scenario file FIRST (operator will check for it immediately)
-        local locust_files=(--from-file="scenario/$TEST_SCENARIO/locust/${SCENARIO}.py")
-        if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$SCENARIO" == "fetch-log" ]; then
+        local locust_client_scenario="$TEST_SCENARIO"
+        if [ "$TEST_SCENARIO" == "compile" ]; then
+            locust_client_scenario=timebased-sign-pruner
+        fi
+        local locust_dir="scenario/$locust_client_scenario/locust"
+        local locust_files=(--from-file="$locust_dir/${SCENARIO}.py")
+        if [ "$locust_client_scenario" == "timebased-sign-pruner" ] && [ "$SCENARIO" == "fetch-log" ]; then
             locust_files+=(--from-file="../../tools/results_log_diagnostics.py")
         fi
-        local auth_helper="scenario/$TEST_SCENARIO/locust/results_auth.py"
+        local auth_helper="$locust_dir/results_auth.py"
         if [ -f "$auth_helper" ]; then
             locust_files+=(--from-file="$auth_helper")
         elif [ "$RESULTS_AUTH_ENABLED" == "true" ]; then
@@ -380,7 +417,7 @@ function run_locust() {
         local locust_log_status=1
         local locust_log_attempt
         local locust_log_attempts=1
-        if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "concurrent" ]; then
+        if [ "$locust_client_scenario" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "concurrent" ]; then
             locust_log_attempts=3
         fi
         for ((locust_log_attempt=1; locust_log_attempt<=locust_log_attempts; locust_log_attempt++)); do
@@ -398,7 +435,7 @@ function run_locust() {
             fi
         done
 
-        if [ "$TEST_SCENARIO" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "after-load" ]; then
+        if [ "$locust_client_scenario" == "timebased-sign-pruner" ] && [ "$LOCUST_RUN_PHASE" == "after-load" ]; then
             # A successful kubectl log stream does not imply a successful Locust test.
             if ! python3 - "$locust_run_log" "$SCENARIO" "$locust_log_status" <<'PY'
 import importlib.util

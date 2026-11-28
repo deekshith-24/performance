@@ -73,20 +73,5 @@ fi
 create_pipeline_from_j2_template pipeline.yaml.j2 "task_count=${TEST_BIGBANG_MULTI_STEP__TASK_COUNT}, step_count=${TEST_BIGBANG_MULTI_STEP__STEP_COUNT}, line_count=${TEST_BIGBANG_MULTI_STEP__LINE_COUNT}, log_bytes_per_step=${TEST_BIGBANG_MULTI_STEP__LOG_BYTES_PER_STEP}"
 
 if [ "$LOCUST_RUN_PHASE" == concurrent ]; then
-    # Finish background cleanup before the outer CI trap collects artifacts.
-    CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP=$(trap -p EXIT)
-    concurrent_locust_cleanup() {
-        local status=$?
-        if [ -n "${CONCURRENT_LOCUST_PID:-}" ]; then
-            if jobs -pr | grep -qx "$CONCURRENT_LOCUST_PID"; then
-                kill "$CONCURRENT_LOCUST_PID" 2>/dev/null || true
-            fi
-            wait "$CONCURRENT_LOCUST_PID" 2>/dev/null || true
-        fi
-        return "$status"
-    }
-    trap concurrent_locust_cleanup EXIT
-    python3 "scenario/$TEST_SCENARIO/concurrent-locust.py" --parent-pid "$$" &
-    CONCURRENT_LOCUST_PID=$!
-    info "Concurrent Locust coordinator started (PID $CONCURRENT_LOCUST_PID)"
+    start_concurrent_locust
 fi

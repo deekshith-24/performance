@@ -1,6 +1,23 @@
 # shellcheck source=/dev/null
 source scenario/common/lib.sh
 
+if [[ "${RUN_LOCUST:-false}" == "true" ]]; then
+    if [[ "${INSTALL_RESULTS:-false}" != "true" ]]; then
+        fatal "Compile Locust reads require INSTALL_RESULTS=true"
+    fi
+    export LOCUST_RUN_PHASE="${LOCUST_RUN_PHASE:-after-load}"
+    export LOCUST_DURATION="${LOCUST_DURATION:-5m}"
+    export LOCUST_USERS="${LOCUST_USERS:-250}"
+    case "$LOCUST_RUN_PHASE" in
+        after-load) ;;
+        concurrent)
+            export TEST_SCENARIO TEST_NAMESPACE
+            python3 scenario/timebased-sign-pruner/concurrent-locust.py --validate
+            ;;
+        *) fatal "LOCUST_RUN_PHASE must be after-load or concurrent" ;;
+    esac
+fi
+
 if [[ -z "${TOTAL_TIMEOUT:-}" ]]; then
     return 0
 fi
@@ -33,4 +50,8 @@ if [[ "${INSTALL_RESULTS:-false}" == "true" ]]; then
             fatal "COMPILE_PRUNER_MODE must be event or soft"
             ;;
     esac
+fi
+
+if [[ "${RUN_LOCUST:-false}" == "true" && "${LOCUST_RUN_PHASE:-}" == "concurrent" ]]; then
+    start_concurrent_locust
 fi

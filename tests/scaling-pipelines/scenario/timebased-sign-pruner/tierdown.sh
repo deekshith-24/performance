@@ -12,13 +12,7 @@ LOCUST_WAIT_TIME=${LOCUST_WAIT_TIME:-600} # [Default: 10 mins]
 if [ "${LOCUST_RUN_PHASE:-after-load}" == concurrent ]; then
     # Preserve failed read results, but still allow the usual post-load settling time.
     concurrent_locust_status=0
-    wait "$CONCURRENT_LOCUST_PID" || concurrent_locust_status=$?
-    CONCURRENT_LOCUST_PID=""
-    python3 "scenario/$TEST_SCENARIO/concurrent-locust.py" --verify-overlap || concurrent_locust_status=$?
-    trap - EXIT
-    if [ -n "$CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP" ]; then
-        eval "$CONCURRENT_LOCUST_PREVIOUS_EXIT_TRAP"
-    fi
+    finish_concurrent_locust || concurrent_locust_status=$?
     wait_for_timeout "$LOCUST_WAIT_TIME" "allow final Results and log ingestion to settle"
 fi
 
